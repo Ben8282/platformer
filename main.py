@@ -1,10 +1,10 @@
 """A small procedural 2D platformer built with pygame.
 
 Run it with:
-    python platformer.py
+    python main.py
 
 For automated testing/CI, a headless smoke test is available:
-    python platformer.py --smoke-test
+    python main.py --smoke-test
 
 Importing this module (e.g. from a test file) does NOT open a window or start
 the game loop -- everything that touches pygame's display/audio/event system
@@ -27,7 +27,7 @@ import pygame
 # ---------------- paths ----------------
 # Resolve every file path relative to this script, not the current working
 # directory, so the game works the same whether you run it from its own
-# folder, a shortcut, or `python /some/other/place/platformer.py`.
+# folder, a shortcut, or `python /some/other/place/main.py`.
 BASE_DIR = Path(__file__).resolve().parent
 ASSET_DIR = BASE_DIR / "assets"
 HERO_SPRITESHEET_PATH = ASSET_DIR / "hero_spritesheet.png"
@@ -2897,7 +2897,7 @@ def draw_fps_overlay(top_right_y=10):
 # ---------------- init: pygame/display ----------------
 def init_pygame():
     """Everything that touches the OS window/audio device. Safe to call exactly once
-    per process, and never runs just from `import platformer`."""
+    per process, and never runs just from `import main`."""
     global screen, clock, SOUND_ENABLED, fullscreen
 
     # On Windows, an app that isn't marked DPI-aware gets its window bitmap-scaled by
