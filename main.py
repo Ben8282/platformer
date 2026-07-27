@@ -29,7 +29,7 @@ import pygame
 # directory, so the game works the same whether you run it from its own
 # folder, a shortcut, or `python /some/other/place/main.py`.
 BASE_DIR = Path(__file__).resolve().parent
-ASSET_DIR = BASE_DIR / "assets"
+ASSET_DIR = BASE_DIR
 HERO_SPRITESHEET_PATH = ASSET_DIR / "hero_spritesheet.png"
 SAVE_FILE = str(BASE_DIR / "save.txt")  # kept next to the script, same as before
 
