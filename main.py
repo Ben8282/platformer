@@ -31,7 +31,51 @@ import pygame
 BASE_DIR = Path(__file__).resolve().parent
 ASSET_DIR = BASE_DIR
 HERO_SPRITESHEET_PATH = ASSET_DIR / "hero_spritesheet.png"
-SAVE_FILE = str(BASE_DIR / "save.txt")  # kept next to the script, same as before
+
+
+def _app_dir():
+    """Where the save file should live -- not necessarily wherever a packaged build
+    happens to unpack its bundled code/assets to internally (BASE_DIR above, which stays
+    correct for HERO_SPRITESHEET_PATH regardless of platform: Nuitka extracts bundled
+    data files there, so that lookup is right exactly as it is).
+
+    Plain `python main.py` (not compiled): BASE_DIR is already the right, visible
+    folder -- use it as-is, on every platform.
+
+    Windows, compiled (`__compiled__` is a global Nuitka only defines in a compiled
+    module, so this whole function body below is a no-op otherwise): next to the real,
+    user-visible .exe, so a packaged game is just "two files sitting together" like a
+    portable app is expected to be on Windows. A `--onefile` build unpacks to a fresh
+    throwaway temp folder every single launch, so BASE_DIR there is useless for anything
+    meant to persist -- NUITKA_ONEFILE_DIRECTORY is the environment variable Nuitka
+    itself sets to the directory containing the actual .exe the user launched, confirmed
+    empirically (not guessed) by compiling a one-line diagnostic script and inspecting
+    its output. sys.argv[0]'s directory is the fallback for a `--standalone` build (no
+    onefile unpacking, so no such env var -- sys.argv[0] is already the real exe path
+    there) or on the off chance the env var is ever unset.
+
+    Linux/macOS, compiled: deliberately NOT "next to the binary" the way Windows is --
+    an AppImage mounts itself read-only at a fresh temp path every launch (the same
+    "unpacks somewhere throwaway" problem as Windows onefile, just via squashfs+FUSE
+    instead), and a Flatpak's install location isn't even writable by the app at all.
+    Follows the XDG Base Directory spec instead (~/.local/share/<app>, or
+    $XDG_DATA_HOME if set) -- what every well-behaved Linux app does, portable-app
+    conventions don't really exist there, and it keeps working no matter how the game
+    ends up packaged (AppImage, Flatpak, a plain standalone folder, ...)."""
+    if "__compiled__" in globals():
+        if sys.platform == "win32":
+            onefile_dir = os.environ.get("NUITKA_ONEFILE_DIRECTORY")
+            if onefile_dir:
+                return Path(onefile_dir)
+            return Path(sys.argv[0]).resolve().parent
+        xdg_data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        data_dir = Path(xdg_data_home) / "PygamePlatformer"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir
+    return BASE_DIR
+
+
+SAVE_FILE = str(_app_dir() / "save.txt")  # next to the real .exe once packaged -- see _app_dir()
 
 # ---------------- core constants ----------------
 TS = 40  # tile size in pixels
@@ -56,6 +100,96 @@ SAVE_VERSION = 5  # bumped: trails were reordered/rebalanced so price correlates
                   # strength (see TRAILS) -- equipped_trail_id positions shifted, so an
                   # old save's equipped trail is reset to "none" on load (ownership is
                   # untouched, since trail_owned_* is keyed by name, not position)
+
+# ---------------- fixed-timestep simulation architecture ----------------
+# Every velocity/acceleration constant in this file (GRAVITY, MOVE_SPEED, JUMP_STRENGTH,
+# DASH_SPEED, the sine-wave "self.t += 0.08" phase steps on flying enemies, Camera's
+# "* 0.15" smoothing factor, Particle's "+= 0.25" gravity, ...) is written as a plain
+# per-update-call increment, the same way it always has been. What makes the *game*
+# frame-rate independent is not rewriting all of those into per-second units and
+# multiplying by a variable dt -- it's guaranteeing that every gameplay update() call
+# happens at a strictly constant rate (SIM_HZ, below) no matter how fast or slow the
+# player's monitor/GPU can render, so "one update() call" always represents exactly the
+# same fixed slice of game time it always implicitly did.
+#
+# Concretely (see run_fixed_updates()/game_loop() further down): rendering happens as
+# often as the FPS cap (or the display) allows, but gameplay simulation only advances in
+# fixed SIM_DT_MS chunks, accumulated against real elapsed time. At a steady 60 FPS this
+# is indistinguishable from the old "one update per rendered frame" behavior. Below 60
+# FPS, more than one fixed tick runs per rendered frame to keep the simulation in lock-
+# step with real time (so the game never runs in slow motion just because rendering
+# fell behind) -- capped at MAX_CATCHUP_TICKS so a huge stall (window drag, breakpoint,
+# a slow asset load) can't make the game try to frantically replay minutes of missed
+# time at once (the classic fixed-timestep "spiral of death"; any backlog beyond the cap
+# is simply dropped, same as pausing briefly would look from the player's perspective).
+# Above 60 FPS, most rendered frames run zero fixed ticks. Naively redrawing the latest
+# simulated state on those frames would only repaint the same positions until the next
+# tick lands, which looks stuttery well above SIM_HZ -- so draw_playing_frame() instead
+# blends each rendered sprite (and the camera) between its pre-tick and post-tick
+# position using the leftover accumulator as a 0..1 blend factor (`alpha`, returned by
+# run_fixed_updates()). This never touches the actual simulated .rect -- it's a
+# render-only offset computed fresh every frame -- so it cannot desync physics/collision
+# no matter how it's tuned. See _snapshot_render_positions()/_interp_rect().
+#
+# Every gameplay system's *timers* (coyote time, jump buffer, hit invincibility, dash
+# cooldown, hazard cycles, particle/popup lifetimes, camera shake, autosave, ...) read
+# _now_ms() instead of pygame.time.get_ticks() directly, for exactly one reason: when
+# several fixed ticks run back-to-back to catch up (the low-FPS case above), they execute
+# in a fraction of a millisecond of *real* wall-clock time, so back-to-back
+# pygame.time.get_ticks() reads would return nearly the same value for all of them --
+# collapsing "5 ticks (~83ms of game time) elapsed" down to "~0ms elapsed" and quietly
+# breaking every elapsed-time-based timer during exactly the frame-rate range (well under
+# 60 FPS) this whole system exists to make correct. The offset only ever grows, by
+# exactly SIM_DT_MS per extra tick within a single burst, and holds steady between
+# bursts -- so it never resets mid-session, but it also never needs to: nothing compares
+# a _now_ms() reading against a raw pygame.time.get_ticks() one, only against another
+# stored _now_ms() reading, and a shared constant bias cancels out of every such
+# subtraction. Direct calls in tests that never go through run_fixed_updates() (i.e.
+# almost all of them -- calling Player.update() etc. directly, not via game_loop()) see
+# offset permanently at 0, so _now_ms() is simply pygame.time.get_ticks() for them.
+# game_loop() zeroes both this and the accumulator on entry, so catch-up bursts from an
+# earlier test/session can never bleed into the next one.
+SIM_HZ = 60                  # fixed simulation rate; every constant above is implicitly
+                              # tuned for "one update() call = 1/SIM_HZ of a second" and
+                              # would need retuning if this ever changed
+SIM_DT_MS = 1000.0 / SIM_HZ   # ms of *game* time simulated per fixed update tick
+MAX_CATCHUP_TICKS = 5         # hard cap on fixed ticks per rendered frame -- see above
+_TICK_EPSILON_MS = 1e-6        # float-rounding slack for the accumulator loop; see run_fixed_updates()
+
+# ---------------- FPS cap (rendering only -- see Settings) ----------------
+# How often run_fixed_updates()/draw_playing_frame() get called (i.e. how often the
+# window repaints) is entirely separate from SIM_HZ above: this only throttles
+# pygame.time.Clock.tick() in game_loop(), which in turn controls how much real time
+# elapses between iterations and therefore how "chunky" the render alpha (see
+# draw_playing_frame()) can get. 0 means uncapped, matching pygame.time.Clock.tick(0)'s
+# own "no limit" convention -- chosen deliberately so fps_cap can be handed straight to
+# clock.tick() with no translation.
+FPS_CAP_UNLIMITED = 0
+FPS_CAP_DEFAULT = 60
+FPS_CAP_MIN = 1
+FPS_CAP_MAX = 1000     # generous ceiling for hand-typed values; no real display exceeds this
+FPS_CAP_STEP = 5        # per-click increment for the Settings screen's -/+ buttons
+
+_tick_time_offset_ms = 0.0  # nudged forward during a multi-tick catch-up burst; see _now_ms()
+_accumulator_ms = 0.0        # real ms of simulation time owed but not yet run; see run_fixed_updates()
+
+
+def _now_ms():
+    """The clock every gameplay system (Player, enemies, hazards, particles, popups,
+    camera shake, autosave, ...) reads instead of pygame.time.get_ticks() directly --
+    see the fixed-timestep architecture comment above for exactly why. Purely cosmetic,
+    non-gameplay UI animation (e.g. the Trails menu's swatch color preview) should keep
+    using pygame.time.get_ticks() directly instead: those run continuously while
+    browsing menus, when the fixed-tick simulation (and this clock, functionally) isn't
+    advancing at all.
+
+    Always an int, like pygame.time.get_ticks() itself -- _tick_time_offset_ms
+    accumulates in SIM_DT_MS (a repeating fraction, 1000/60) steps, and plenty of
+    existing gameplay code divides an elapsed-time reading and uses it as a list index
+    (e.g. HERO_DIE_FRAMES[elapsed // DIE_ANIM_INTERVAL]), which requires an int just like
+    it always got from pygame.time.get_ticks() before this function existed."""
+    return int(pygame.time.get_ticks() + _tick_time_offset_ms)
+
 
 # ---------------- upgrade balance table ----------------
 # Every purchasable effect is a small per-level increment rather than one big unlock, and
@@ -743,7 +877,7 @@ class CrumblingPlatform(pygame.sprite.Sprite):
         return surf
 
     def update(self, player_rect=None, *_args, **_kwargs):
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         if self.state == "solid":
             self.image = self._solid_img
             standing_on = (player_rect is not None
@@ -938,7 +1072,7 @@ class TimedSpike(pygame.sprite.Sprite):
         return surf
 
     def update(self, *_args, **_kwargs):
-        t = (pygame.time.get_ticks() + self.phase_offset) % TIMED_SPIKE_CYCLE_MS
+        t = (_now_ms() + self.phase_offset) % TIMED_SPIKE_CYCLE_MS
         retracted_ms = TIMED_SPIKE_CYCLE_MS - TIMED_SPIKE_EXTENDED_MS - TIMED_SPIKE_WARN_MS
         if t < retracted_ms:
             self.image = self._retracted_img
@@ -986,7 +1120,7 @@ class GasVent(pygame.sprite.Sprite):
         return surf
 
     def update(self, *_args, **_kwargs):
-        t = (pygame.time.get_ticks() + self.phase_offset) % GAS_VENT_CYCLE_MS
+        t = (_now_ms() + self.phase_offset) % GAS_VENT_CYCLE_MS
         idle_ms = GAS_VENT_CYCLE_MS - GAS_VENT_ACTIVE_MS - GAS_VENT_WARN_MS
         if t < idle_ms:
             self.image = self._idle_img
@@ -1186,10 +1320,10 @@ class JumperEnemy(pygame.sprite.Sprite):
         self.rect = self.image.get_rect(topleft=(x + 2, y + 6))
         self.vel_y = 0
         self.on_ground = False
-        self.next_hop = pygame.time.get_ticks() + random.randint(400, 1200)
+        self.next_hop = _now_ms() + random.randint(400, 1200)
 
     def update(self, platforms, player_rect=None):
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         if self.on_ground and now >= self.next_hop:
             self.vel_y = -10
             self.on_ground = False
@@ -1347,11 +1481,11 @@ class Projectile(pygame.sprite.Sprite):
         pygame.draw.ellipse(self.image, PROJECTILE_COLOR, (0, 0, w, h))
         self.rect = self.image.get_rect(center=(x, y))
         self.vel_x = PROJECTILE_SPEED * direction
-        self.spawn_time = pygame.time.get_ticks()
+        self.spawn_time = _now_ms()
 
     def update(self, platforms=()):
         self.rect.x += self.vel_x
-        if pygame.time.get_ticks() - self.spawn_time > PROJECTILE_LIFETIME_MS:
+        if _now_ms() - self.spawn_time > PROJECTILE_LIFETIME_MS:
             self.kill()
             return
         for p in platforms:
@@ -1377,13 +1511,13 @@ class LobbedProjectile(pygame.sprite.Sprite):
         self.rect = self.image.get_rect(center=(x, y))
         self.vel_x = LOB_SPEED_X * direction
         self.vel_y = LOB_SPEED_Y
-        self.spawn_time = pygame.time.get_ticks()
+        self.spawn_time = _now_ms()
 
     def update(self, platforms=()):
         self.vel_y += LOB_GRAVITY
         self.rect.x += int(self.vel_x)
         self.rect.y += int(self.vel_y)
-        if pygame.time.get_ticks() - self.spawn_time > PROJECTILE_LIFETIME_MS:
+        if _now_ms() - self.spawn_time > PROJECTILE_LIFETIME_MS:
             self.kill()
             return
         for p in platforms:
@@ -1410,11 +1544,11 @@ class TurretEnemy(pygame.sprite.Sprite):
         self.image = self._img_idle
         self.rect = self.image.get_rect(topleft=(x + 3, y + 10))
         self.telegraphing = False
-        self.next_fire = pygame.time.get_ticks() + random.randint(600, TURRET_FIRE_INTERVAL_MAX_MS)
+        self.next_fire = _now_ms() + random.randint(600, TURRET_FIRE_INTERVAL_MAX_MS)
 
     def update(self, platforms=(), player_rect=None):
         global projectiles
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         self.telegraphing = now >= self.next_fire - TURRET_TELEGRAPH_MS
         self.image = self._img_telegraph if self.telegraphing else self._img_idle
         if now >= self.next_fire:
@@ -1443,11 +1577,11 @@ class SpitterEnemy(pygame.sprite.Sprite):
         self.image = self._img_idle
         self.rect = self.image.get_rect(topleft=(x + 3, y + 10))
         self.telegraphing = False
-        self.next_fire = pygame.time.get_ticks() + random.randint(600, SPITTER_FIRE_INTERVAL_MAX_MS)
+        self.next_fire = _now_ms() + random.randint(600, SPITTER_FIRE_INTERVAL_MAX_MS)
 
     def update(self, platforms=(), player_rect=None):
         global projectiles
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         in_range = (player_rect is not None
                     and abs(player_rect.centerx - self.rect.centerx) < SPITTER_RANGE
                     and player_rect.centery > self.rect.top - TS)
@@ -1507,12 +1641,12 @@ class Particle:
         self.y = y
         self.vel = pygame.Vector2(random.uniform(-speed, speed), random.uniform(-speed * 1.5, -0.5))
         self.color = color
-        self.spawn_time = pygame.time.get_ticks()
+        self.spawn_time = _now_ms()
         self.life = life
         self.shape = shape
 
     def alive(self):
-        return pygame.time.get_ticks() - self.spawn_time < self.life
+        return _now_ms() - self.spawn_time < self.life
 
     def update(self):
         self.x += self.vel.x
@@ -1520,7 +1654,7 @@ class Particle:
         self.vel.y += 0.25
 
     def draw(self, surf, camera):
-        age = (pygame.time.get_ticks() - self.spawn_time) / self.life
+        age = (_now_ms() - self.spawn_time) / self.life
         alpha = max(0, 255 - int(255 * age))
         size = max(1, int(4 * (1 - age)))
         s = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
@@ -1543,14 +1677,14 @@ class Popup:
         self.y = y
         self.text = text
         self.color = color
-        self.spawn_time = pygame.time.get_ticks()
+        self.spawn_time = _now_ms()
         self.life = life
 
     def alive(self):
-        return pygame.time.get_ticks() - self.spawn_time < self.life
+        return _now_ms() - self.spawn_time < self.life
 
     def draw(self, surf, camera, font):
-        age = (pygame.time.get_ticks() - self.spawn_time) / self.life
+        age = (_now_ms() - self.spawn_time) / self.life
         y_off = -22 * age
         alpha = max(0, 255 - int(255 * age))
         txt = font.render(self.text, True, self.color)
@@ -1585,7 +1719,7 @@ def maybe_spawn_trail_particles(player_rect, player_state):
     trail = TRAILS_BY_KEY.get(equipped_trail_key)
     if not trail:
         return
-    now = pygame.time.get_ticks()
+    now = _now_ms()
     if now - _last_trail_particle_time < TRAIL_PARTICLE_INTERVAL_MS:
         return
     _last_trail_particle_time = now
@@ -1723,7 +1857,7 @@ class Player(pygame.sprite.Sprite):
         self._ice_vel = 0.0        # blended horizontal velocity while standing on an IceFloor tile
 
     def _update_animation(self):
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         if self.state == "dead":
             elapsed = now - self.death_time
             self.die_frame_index = min(len(HERO_DIE_FRAMES) - 1, elapsed // DIE_ANIM_INTERVAL)
@@ -1743,14 +1877,14 @@ class Player(pygame.sprite.Sprite):
         self.image = frame
 
     def try_jump(self):
-        self.jump_buffer_time = pygame.time.get_ticks()
+        self.jump_buffer_time = _now_ms()
 
     def try_dash(self):
         """Shift key. No-op if Dash hasn't been bought or the cooldown hasn't elapsed --
         callers don't need to check either condition themselves."""
         if upgrades["dash"] <= 0:
             return
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         if now < self.dash_ready_time:
             return
         self.dashing_until = now + DASH_DURATION_MS
@@ -1766,7 +1900,7 @@ class Player(pygame.sprite.Sprite):
         global stat_deaths
         if self.state != "dead":
             self.state = "dead"
-            self.death_time = pygame.time.get_ticks()
+            self.death_time = _now_ms()
             self.vel = pygame.Vector2(0, 0)
             stat_deaths += 1
             mark_dirty()
@@ -1779,7 +1913,7 @@ class Player(pygame.sprite.Sprite):
         (they recharge every life/level so they're the "cheap" layer), then extra hearts,
         then a one-time Second Wind save, then death. Falling into the void bypasses this
         entirely -- these upgrades protect against hazards/enemies, not bottomless pits."""
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         if now < self.invincible_until:
             return
         if self.shield_charges > 0:
@@ -1807,6 +1941,11 @@ class Player(pygame.sprite.Sprite):
 
     def respawn(self):
         self.rect.topleft = self.checkpoint_pos or self.start_pos
+        # Hard teleport, not incremental movement -- reset the render-interpolation
+        # snapshot (see _snapshot_render_positions()) too, or draw_playing_frame() would
+        # blend from the pre-death position across to this one and visibly slide the
+        # player across the level for a frame instead of a clean cut.
+        self._prev_topleft = self.rect.topleft
         self.pos_x = float(self.rect.x)
         self.vel = pygame.Vector2(0, 0)
         self.state = "alive"
@@ -1819,7 +1958,7 @@ class Player(pygame.sprite.Sprite):
         # already-alert enemy (a ChargerEnemy in particular, since it locks on and
         # closes distance fast) must never be able to chain straight into another death
         # before the player has even had a chance to react and move away.
-        self.invincible_until = pygame.time.get_ticks() + RESPAWN_INVINCIBILITY_MS
+        self.invincible_until = _now_ms() + RESPAWN_INVINCIBILITY_MS
         self.glide_frames_left = _effective_glide_max()
         self.dash_ready_time = 0
         self.dashing_until = 0
@@ -1906,7 +2045,7 @@ class Player(pygame.sprite.Sprite):
         global score, wallet, stat_coins  # stat_stomps is now updated inside _handle_stomp()
         if self.state == "dead":
             self._update_animation()
-            if pygame.time.get_ticks() - self.death_time > 600:
+            if _now_ms() - self.death_time > 600:
                 self.respawn()
             return
 
@@ -1924,7 +2063,7 @@ class Player(pygame.sprite.Sprite):
             self.vel.x = move_speed
             self.facing = 1
 
-        now = pygame.time.get_ticks()
+        now = _now_ms()
         if now < self.dashing_until:
             # Dash overrides normal horizontal input for its short duration, using the
             # direction locked in by try_dash() (self.dash_facing) rather than the live
@@ -2107,13 +2246,13 @@ class Camera:
         if not screen_shake_enabled:
             return
         self.shake_mag = magnitude
-        self.shake_until = pygame.time.get_ticks() + duration_ms
+        self.shake_until = _now_ms() + duration_ms
 
     def update(self, target_rect):
         desired = target_rect.centerx - SCREEN_W / 2
         desired = max(0, min(desired, self.level_width - SCREEN_W))
         self.x += (desired - self.x) * 0.15
-        if pygame.time.get_ticks() < self.shake_until:
+        if _now_ms() < self.shake_until:
             self.shake_ox = random.randint(-self.shake_mag, self.shake_mag)
             self.shake_oy = random.randint(-self.shake_mag, self.shake_mag)
         else:
@@ -2209,6 +2348,83 @@ class Slider:
         pygame.draw.circle(surf, (255, 60, 190), (hx, self.rect.centery), 10, 2)
         label_surf = font.render(f"{self.label}: {int(self.value * 100)}%", True, (255, 90, 210))
         surf.blit(label_surf, label_surf.get_rect(midbottom=(self.rect.centerx, self.rect.y - 8)))
+
+
+class FpsCapControl:
+    """The Settings screen's FPS Cap row: -/+ buttons step a remembered numeric value by
+    FPS_CAP_STEP, clicking the number opens type-to-enter (any positive integer, not just
+    a preset), and UNLIMITED removes the cap entirely -- see FPS_CAP_* near SIM_HZ.
+    `value` (what the rest of the game reads) is 0 for Unlimited, else a clamped int.
+    Stepping/typing while Unlimited resumes from the last numeric value instead of some
+    arbitrary point, so flipping back out of Unlimited never surprises the player."""
+
+    def __init__(self, x, y, value=FPS_CAP_DEFAULT):
+        self.value = FPS_CAP_UNLIMITED if value <= 0 else _clamp(value, FPS_CAP_MIN, FPS_CAP_MAX)
+        self._last_numeric = self.value or FPS_CAP_DEFAULT
+        self.editing = False
+        self.edit_text = ""
+        self.minus_rect = pygame.Rect(x, y, 30, 30)
+        self.value_rect = pygame.Rect(x + 36, y, 100, 30)
+        self.plus_rect = pygame.Rect(x + 142, y, 30, 30)
+        self.unlimited_rect = pygame.Rect(x + 182, y, 110, 30)
+
+    def _set_numeric(self, new_value):
+        self._last_numeric = _clamp(new_value, FPS_CAP_MIN, FPS_CAP_MAX)
+        self.value = self._last_numeric
+
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.minus_rect.collidepoint(event.pos):
+                self.editing = False
+                self._set_numeric(self._last_numeric - FPS_CAP_STEP)
+            elif self.plus_rect.collidepoint(event.pos):
+                self.editing = False
+                self._set_numeric(self._last_numeric + FPS_CAP_STEP)
+            elif self.unlimited_rect.collidepoint(event.pos):
+                self.editing = False
+                self.value = FPS_CAP_UNLIMITED
+            elif self.value_rect.collidepoint(event.pos):
+                self.editing = True
+                self.edit_text = ""
+        elif event.type == pygame.KEYDOWN and self.editing:
+            if event.key == pygame.K_RETURN:
+                if self.edit_text:
+                    self._set_numeric(int(self.edit_text))
+                self.editing = False
+                self.edit_text = ""
+            elif event.key == pygame.K_ESCAPE:
+                self.editing = False
+                self.edit_text = ""
+            elif event.key == pygame.K_BACKSPACE:
+                self.edit_text = self.edit_text[:-1]
+            elif event.unicode.isdigit() and len(self.edit_text) < 4:
+                self.edit_text += event.unicode
+
+    def draw(self, surf, font):
+        label = f"FPS Cap: {'Unlimited' if self.value == 0 else self.value}"
+        label_surf = font.render(label, True, (120, 220, 255))
+        surf.blit(label_surf, label_surf.get_rect(midbottom=(
+            (self.minus_rect.x + self.unlimited_rect.right) // 2, self.minus_rect.y - 8)))
+
+        def button(rect, text, active=False):
+            pygame.draw.rect(surf, (0, 200, 255) if active else (60, 60, 78), rect, border_radius=6)
+            pygame.draw.rect(surf, (170, 235, 255), rect, 2, border_radius=6)
+            t = font.render(text, True, (15, 10, 30) if active else (220, 240, 255))
+            surf.blit(t, t.get_rect(center=rect.center))
+
+        button(self.minus_rect, "-")
+        button(self.plus_rect, "+")
+        button(self.unlimited_rect, "UNLIMITED", active=self.value == 0)
+
+        pygame.draw.rect(surf, (30, 30, 42), self.value_rect, border_radius=6)
+        border = (255, 230, 90) if self.editing else (170, 235, 255)
+        pygame.draw.rect(surf, border, self.value_rect, 2, border_radius=6)
+        if self.editing:
+            shown = self.edit_text + "_" if self.edit_text else "_"
+        else:
+            shown = "Unlimited" if self.value == 0 else str(self.value)
+        val_surf = font.render(shown, True, (255, 255, 255))
+        surf.blit(val_surf, val_surf.get_rect(center=self.value_rect.center))
 
 
 def build_menu_background():
@@ -2372,6 +2588,7 @@ SAVE_DEFAULTS = {
     "stat_coins": 0, "stat_stomps": 0, "stat_deaths": 0, "stat_max_combo": 0,
     "equipped_trail_id": 0,  # 0 = no trail equipped, else a 1-based index into TRAILS
     "trail_visible": 1,
+    "fps_cap": FPS_CAP_DEFAULT,  # 0 = Unlimited, else a capped positive integer -- see Settings
 }
 SAVE_DEFAULTS.update({f"upg_{key}": 0 for key in UPGRADE_DEFAULTS})
 SAVE_DEFAULTS.update({f"trail_owned_{key}": 0 for key in TRAIL_DEFAULTS})
@@ -2411,19 +2628,25 @@ def _clamp_save_data(data):
         if not data.get(f"trail_owned_{equipped_key}", 0):
             data["equipped_trail_id"] = 0  # can't have an unowned trail equipped
     data["trail_visible"] = 1 if data.get("trail_visible", 1) else 0
+    fps_cap_value = data.get("fps_cap", FPS_CAP_DEFAULT)
+    data["fps_cap"] = FPS_CAP_UNLIMITED if fps_cap_value <= 0 else _clamp(fps_cap_value, FPS_CAP_MIN, FPS_CAP_MAX)
     return data
 
 
-def load_save():
-    """Read save.txt into a dict of int fields, tolerating a missing file, unreadable
+def load_save(path=None):
+    """Read a save file into a dict of int fields, tolerating a missing file, unreadable
     file, or individual corrupted/garbage lines -- always returns a complete, validated
-    dict (every SAVE_DEFAULTS key present, every value in its safe range)."""
+    dict (every SAVE_DEFAULTS key present, every value in its safe range). Defaults to
+    the currently-configured SAVE_FILE; choose_save_file() passes an explicit `path` to
+    preview *other* save slots without switching the game to them."""
+    if path is None:
+        path = SAVE_FILE
     data = dict(SAVE_DEFAULTS)
-    if not os.path.exists(SAVE_FILE):
-        write_save(data)
+    if not os.path.exists(path):
+        write_save(data, path)
         return data
     try:
-        with open(SAVE_FILE, "r") as f:
+        with open(path, "r") as f:
             lines = f.readlines()
     except OSError:
         return _clamp_save_data(data)
@@ -2461,14 +2684,16 @@ def load_save():
     return _clamp_save_data(data)
 
 
-def write_save(data):
+def write_save(data, path=None):
     # write to a temp file and rename over the real one -- os.replace is atomic, so a
-    # crash or power loss mid-write can never leave save.txt half-written/corrupted
-    tmp_path = SAVE_FILE + ".tmp"
+    # crash or power loss mid-write can never leave the save file half-written/corrupted
+    if path is None:
+        path = SAVE_FILE
+    tmp_path = path + ".tmp"
     with open(tmp_path, "w") as f:
         for key, value in data.items():
             f.write(f"{key}={value}\n")
-    os.replace(tmp_path, SAVE_FILE)
+    os.replace(tmp_path, path)
 
 
 def save_game():
@@ -2491,6 +2716,7 @@ def save_game():
         "stat_max_combo": stat_max_combo,
         "equipped_trail_id": TRAIL_KEY_TO_ID.get(equipped_trail_key, 0) if equipped_trail_key else 0,
         "trail_visible": int(trail_visible),
+        "fps_cap": fps_cap,
     }
     data.update({f"upg_{key}": lvl for key, lvl in upgrades.items()})
     data.update({f"trail_owned_{key}": 1 if key in owned_trails else 0 for key in TRAIL_DEFAULTS})
@@ -2500,6 +2726,105 @@ def save_game():
 
 _dirty = False
 _last_autosave = 0
+
+
+# ---------------- multiple save files ----------------
+def _is_save_filename(name):
+    """True for "save.txt" or "save<digits>.txt" specifically (not e.g.
+    "saved_settings.txt" or "savegame.txt.bak") -- only genuine save slots should ever
+    show up in the picker below."""
+    if not (name.startswith("save") and name.endswith(".txt")):
+        return False
+    middle = name[len("save"):-len(".txt")]
+    return middle == "" or middle.isdigit()
+
+
+def _save_slot_sort_key(filename):
+    digits = filename[len("save"):-len(".txt")]
+    return int(digits) if digits else 0  # "save.txt" (no digits) always sorts first
+
+
+def _discover_save_files():
+    """Every save*.txt file sitting next to the currently-configured SAVE_FILE (same
+    directory) -- lets one shared build/install support independent save slots with zero
+    configuration: drop another save1.txt, save2.txt, ... next to save.txt and
+    choose_save_file() offers a picker automatically. Returns a sorted list of full paths;
+    empty or single-item lists (the overwhelmingly common case, including every brand new
+    install with no save yet) mean there's nothing to choose between."""
+    save_dir = os.path.dirname(SAVE_FILE) or "."
+    if not os.path.isdir(save_dir):
+        return []
+    names = sorted((n for n in os.listdir(save_dir) if _is_save_filename(n)), key=_save_slot_sort_key)
+    return [os.path.join(save_dir, n) for n in names]
+
+
+def _save_picker_layout(candidates):
+    """Fixed (path, preview_data, hitbox_rect) rows for the save picker -- computed once
+    (each candidate file is read via load_save() for a level/score/coins preview) instead
+    of every single frame."""
+    rows = []
+    y = 150
+    for path in candidates:
+        data = load_save(path)
+        rect = pygame.Rect(0, 0, 560, 54)
+        rect.center = (SCREEN_W // 2, y)
+        rows.append((path, data, rect))
+        y += 66
+    return rows
+
+
+def _draw_save_picker(rows, mouse_pos):
+    screen.fill((12, 10, 24))
+    title_surf = pygame.font.SysFont(None, 44).render("MULTIPLE SAVE FILES FOUND", True, (0, 255, 220))
+    screen.blit(title_surf, title_surf.get_rect(center=(SCREEN_W // 2, 60)))
+    sub_font = pygame.font.SysFont(None, 22)
+    sub_surf = sub_font.render("Click a save file to play it", True, (170, 170, 190))
+    screen.blit(sub_surf, sub_surf.get_rect(center=(SCREEN_W // 2, 100)))
+
+    row_font = pygame.font.SysFont(None, 26)
+    for path, data, rect in rows:
+        hovered = rect.collidepoint(mouse_pos)
+        pygame.draw.rect(screen, (58, 84, 82) if hovered else (40, 58, 58), rect, border_radius=8)
+        pygame.draw.rect(screen, (140, 195, 190), rect, 2, border_radius=8)
+        name_surf = row_font.render(os.path.basename(path), True, WHITE)
+        screen.blit(name_surf, (rect.x + 14, rect.y + 6))
+        info_surf = sub_font.render(
+            f"Level {data['level']}   Score {data['score']}   Coins {data['coins']}",
+            True, (170, 200, 198),
+        )
+        screen.blit(info_surf, (rect.x + 14, rect.y + 30))
+    pygame.display.flip()
+
+
+def choose_save_file():
+    """If more than one save*.txt file sits next to the game, shows a simple picker so
+    the player can choose which one to play, and points the global SAVE_FILE at it for
+    the rest of the session -- e.g. so a developer's own save never gets loaded on a
+    fresh player's machine just because a stray save2.txt ended up next to save.txt, or
+    so multiple people can keep separate progress from one shared install. With zero or
+    one candidate (every brand new install, and every existing install before this
+    feature) this returns immediately without drawing anything -- completely unaffected.
+    Runs its own tiny event loop since it happens before init_game_state() has set up the
+    full menu/game state machine."""
+    global SAVE_FILE
+    candidates = _discover_save_files()
+    if len(candidates) <= 1:
+        return
+
+    rows = _save_picker_layout(candidates)
+    picker_clock = pygame.time.Clock()
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit(0)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for path, _data, rect in rows:
+                    if rect.collidepoint(event.pos):
+                        SAVE_FILE = path
+                        return
+        _draw_save_picker(rows, pygame.mouse.get_pos())
+        picker_clock.tick(30)
 
 
 def mark_dirty():
@@ -2512,7 +2837,7 @@ def mark_dirty():
 
 def maybe_autosave():
     global _last_autosave
-    now = pygame.time.get_ticks()
+    now = _now_ms()
     if _dirty and now - _last_autosave >= AUTOSAVE_INTERVAL_MS:
         save_game()
         _last_autosave = now
@@ -2721,10 +3046,11 @@ def sync_settings_from_widgets():
     them immediately. Called both when starting a run AND when quitting from the menu,
     so a slider drag or toggle flip is never silently lost just because you closed the
     game instead of pressing Play."""
-    global screen_shake_enabled, music_volume, sfx_volume
+    global screen_shake_enabled, music_volume, sfx_volume, fps_cap
     screen_shake_enabled = toggle_shake.value
     music_volume = int(slider_volume.value * 100)
     sfx_volume = int(slider_sfx.value * 100)
+    fps_cap = fps_cap_control.value
     music.set_volume(music_volume / 100.0)
     apply_sfx_volume(sfx_volume / 100.0)
 
@@ -3032,7 +3358,7 @@ def init_game_state():
     global player_start, checkpoints
     global level_width, level_palette, camera, background, player
     global font, small_font, title_font, MENU_BG
-    global toggle_shake, slider_volume, slider_sfx
+    global toggle_shake, slider_volume, slider_sfx, fps_cap, fps_cap_control
     global PLAY_RECT, SHOP_ENTRY_RECT, TRAIL_ENTRY_RECT, HELP_ENTRY_RECT, SHOP_BACK_PROMPT, SHOP_BACK_RECT
     global TRAIL_UNEQUIP_RECT, TRAIL_VISIBILITY_RECT
     global PAUSE_RESUME_RECT, PAUSE_HELP_RECT, PAUSE_SETTINGS_RECT, PAUSE_MAIN_MENU_RECT, PAUSE_QUIT_RECT
@@ -3041,7 +3367,7 @@ def init_game_state():
     global particles, popups, _dirty, _last_autosave
     global owned_trails, equipped_trail_key, trail_visible, _last_trail_particle_time, trail_page, recent_trails
     global paused_from, help_scroll, is_replay, replay_level, replay_page
-    global REPLAY_ENTRY_RECT
+    global REPLAY_ENTRY_RECT, SETTINGS_ENTRY_RECT
 
     _save_data = load_save()
     level_num = _save_data["level"]
@@ -3055,6 +3381,7 @@ def init_game_state():
     stat_stomps = _save_data["stat_stomps"]
     stat_deaths = _save_data["stat_deaths"]
     stat_max_combo = _save_data["stat_max_combo"]
+    fps_cap = _save_data["fps_cap"]
     music.set_volume(music_volume / 100.0)
     apply_sfx_volume(sfx_volume / 100.0)
 
@@ -3079,14 +3406,16 @@ def init_game_state():
     toggle_shake = Toggle(SCREEN_W // 2 - 32, 110, "Screen Shake", screen_shake_enabled)
     slider_volume = Slider(SCREEN_W // 2 - 100, 175, 200, "Music Volume", music_volume / 100.0)
     slider_sfx = Slider(SCREEN_W // 2 - 100, 235, 200, "Sound Effects", sfx_volume / 100.0)
+    fps_cap_control = FpsCapControl(SCREEN_W // 2 - 146, 300, fps_cap)
     PLAY_RECT = pygame.Rect(0, 0, 240, 54)
     PLAY_RECT.center = (SCREEN_W // 2, 278)
     _menu_btn_w, _menu_btn_h, _menu_btn_gap = 130, 40, 14
-    _menu_row_start_x = SCREEN_W // 2 - (_menu_btn_w * 4 + _menu_btn_gap * 3) // 2
+    _menu_row_start_x = SCREEN_W // 2 - (_menu_btn_w * 5 + _menu_btn_gap * 4) // 2
     SHOP_ENTRY_RECT = pygame.Rect(_menu_row_start_x, 320, _menu_btn_w, _menu_btn_h)
     TRAIL_ENTRY_RECT = pygame.Rect(_menu_row_start_x + (_menu_btn_w + _menu_btn_gap), 320, _menu_btn_w, _menu_btn_h)
     HELP_ENTRY_RECT = pygame.Rect(_menu_row_start_x + 2 * (_menu_btn_w + _menu_btn_gap), 320, _menu_btn_w, _menu_btn_h)
     REPLAY_ENTRY_RECT = pygame.Rect(_menu_row_start_x + 3 * (_menu_btn_w + _menu_btn_gap), 320, _menu_btn_w, _menu_btn_h)
+    SETTINGS_ENTRY_RECT = pygame.Rect(_menu_row_start_x + 4 * (_menu_btn_w + _menu_btn_gap), 320, _menu_btn_w, _menu_btn_h)
     SHOP_BACK_PROMPT = "PRESS ESC OR CLICK TO GO BACK"
     SHOP_BACK_RECT = small_font.render(SHOP_BACK_PROMPT, True, WHITE).get_rect(center=(SCREEN_W // 2, 415))
     TRAIL_UNEQUIP_RECT = pygame.Rect(SCREEN_W // 2 - 260, 103, 220, 32)
@@ -3121,8 +3450,7 @@ def init_game_state():
     particles = []
     popups = []
     _dirty = False
-    _last_autosave = pygame.time.get_ticks()
-
+    _last_autosave = _now_ms()
 
 # ---------------- game loop ----------------
 def handle_events():
@@ -3141,7 +3469,7 @@ def handle_events():
                 elif state == "paused_settings":
                     sync_settings_from_widgets()
                     save_game()
-                    state = "paused"
+                    state = paused_from  # "menu" or "paused", whichever opened Settings
                 elif state == "menu":
                     quit_game()
                 elif state == "playing":
@@ -3172,6 +3500,9 @@ def handle_events():
                 if event.key == pygame.K_r:
                     replay_search_text = ""
                     state = "replay_picker"
+                if event.key == pygame.K_o:
+                    paused_from = "menu"
+                    state = "paused_settings"
             elif state == "replay_picker":
                 if event.key == pygame.K_UP:
                     replay_page = max(0, replay_page - 1)
@@ -3245,6 +3576,9 @@ def handle_events():
                     state = "help"
                 elif REPLAY_ENTRY_RECT.collidepoint(event.pos):
                     state = "replay_picker"
+                elif SETTINGS_ENTRY_RECT.collidepoint(event.pos):
+                    paused_from = "menu"
+                    state = "paused_settings"
         elif state == "shop":
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 category = SHOP_CATEGORIES[shop_page]
@@ -3322,6 +3656,7 @@ def handle_events():
                     paused_from = "paused"
                     state = "help"
                 elif PAUSE_SETTINGS_RECT.collidepoint(event.pos):
+                    paused_from = "paused"
                     state = "paused_settings"
                 elif PAUSE_MAIN_MENU_RECT.collidepoint(event.pos):
                     if is_replay:
@@ -3336,13 +3671,14 @@ def handle_events():
             slider_volume.handle_event(event)
             sfx_was_dragging = slider_sfx.dragging
             slider_sfx.handle_event(event)
+            fps_cap_control.handle_event(event)
             if sfx_was_dragging and event.type == pygame.MOUSEBUTTONUP:
                 snd_coin.play()
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if SHOP_BACK_RECT.collidepoint(event.pos):
                     sync_settings_from_widgets()
                     save_game()
-                    state = "paused"
+                    state = paused_from  # "menu" or "paused", whichever opened Settings
 
 
 def draw_menu():
@@ -3362,6 +3698,7 @@ def draw_menu():
     draw_menu_button(TRAIL_ENTRY_RECT, "TRAILS", TRAIL_ENTRY_RECT.collidepoint(mouse_pos), sub_label="T")
     draw_menu_button(HELP_ENTRY_RECT, "HELP", HELP_ENTRY_RECT.collidepoint(mouse_pos), sub_label="H")
     draw_menu_button(REPLAY_ENTRY_RECT, "REPLAY", REPLAY_ENTRY_RECT.collidepoint(mouse_pos), sub_label="R")
+    draw_menu_button(SETTINGS_ENTRY_RECT, "SETTINGS", SETTINGS_ENTRY_RECT.collidepoint(mouse_pos), sub_label="O")
 
     stats_surf = small_font.render(
         f"Lifetime: {stat_coins:,} coins earned | {stat_stomps:,} stomps | {stat_deaths:,} deaths",
@@ -3684,10 +4021,12 @@ HELP_CONTENT = [
         "there: Resume, open Help, adjust Settings, return to the Main Menu, or Quit.",
     ]),
     ("Settings & Statistics", [
-        "Screen Shake, Music Volume, and Sound Effects volume live on the main menu",
-        "(and in Pause -> Settings during a run). The Shop's Statistics tab shows your",
-        "current level, score, lifetime coins earned, stomps, deaths, best stomp combo,",
-        "and how many upgrades/trails you own.",
+        "Screen Shake, Music Volume, and Sound Effects volume live on the main menu;",
+        "the full Settings screen (same controls, plus FPS Cap) opens from the main",
+        "menu's SETTINGS button (O) or Pause -> Settings during a run. FPS Cap picks",
+        "any frame rate, or Unlimited -- it only changes smoothness, never game speed.",
+        "The Shop's Statistics tab shows your current level, score, lifetime coins",
+        "earned, stomps, deaths, best stomp combo, and how many upgrades/trails you own.",
     ]),
 ]
 
@@ -3829,12 +4168,19 @@ def draw_paused():
 
 
 def draw_paused_settings():
+    global fps_cap
+    # Applied straight from the live widget every frame (same pattern draw_menu() uses
+    # for music/SFX volume) so dragging/typing a new FPS Cap takes effect on the very
+    # next rendered frame -- no separate "Apply" step, no restart needed.
+    fps_cap = fps_cap_control.value
+
     screen.blit(MENU_BG, (0, 0))
     draw_glow_text(screen, "SETTINGS", title_font, (SCREEN_W // 2, 60), (0, 255, 220))
 
     toggle_shake.draw(screen, small_font)
     slider_volume.draw(screen, small_font)
     slider_sfx.draw(screen, small_font)
+    fps_cap_control.draw(screen, small_font)
 
     back_surf = small_font.render("PRESS ESC OR CLICK TO GO BACK", True, (200, 200, 220))
     screen.blit(back_surf, SHOP_BACK_RECT)
@@ -3843,7 +4189,54 @@ def draw_paused_settings():
     pygame.display.flip()
 
 
-def update_and_draw_playing():
+def _snapshot_render_positions():
+    """Records where every rendered sprite (plus the player and camera) is *about* to
+    move from, right before a fixed tick runs. draw_playing_frame() blends between this
+    and the post-tick position it ends up at, so a rendered frame that lands between two
+    ticks (any time the FPS cap is above SIM_HZ) shows smooth in-between motion instead
+    of holding the same simulated position until the next tick lands. Purely a rendering
+    concern -- stored as an extra attribute on each sprite, never read by any gameplay
+    code, and never influences collision/physics.
+
+    Covers every group drawn via camera.apply() in draw_playing_frame() -- static groups
+    (checkpoints, wind_zones) are harmless no-ops here, and it's one less thing to
+    remember to touch if that ever changes."""
+    for group in (platforms, wind_zones, one_way_platforms, checkpoints, spikes, coins, enemies, projectiles):
+        for spr in group:
+            spr._prev_topleft = spr.rect.topleft
+    player._prev_topleft = player.rect.topleft
+    camera._prev_x = camera.x
+
+
+def _lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def _interp_rect(spr, alpha):
+    """spr.rect blended `alpha` (0..1) of the way from its pre-tick position (see
+    _snapshot_render_positions()) to its current, already-simulated position. Falls back
+    to the exact current rect for alpha>=1 (the common case: a rendered frame that lands
+    exactly on a tick boundary, or any direct call with no interpolation requested -- see
+    update_and_draw_playing()) and for a sprite with no snapshot yet (spawned this tick,
+    e.g. a SplitterEnemy's shards or a freshly fired projectile -- it simply appears at
+    its true spawn position instead of sliding in from a stale/missing one)."""
+    if alpha >= 1.0:
+        return spr.rect
+    prev = getattr(spr, "_prev_topleft", None)
+    if prev is None:
+        return spr.rect
+    cx, cy = spr.rect.topleft
+    r = spr.rect.copy()
+    r.topleft = (round(_lerp(prev[0], cx, alpha)), round(_lerp(prev[1], cy, alpha)))
+    return r
+
+
+def _update_playing_tick():
+    """Exactly one fixed simulation tick (1/SIM_HZ of game time) for the "playing"/
+    "level_complete" states -- gameplay logic, autosave, and particle/popup upkeep. Called
+    once per tick by run_fixed_updates() (zero or more times per rendered frame -- see the
+    fixed-timestep comment near SIM_HZ) and exactly once by update_and_draw_playing() for
+    direct/standalone callers (every existing test)."""
     global state, transition_start, particles, popups
 
     if state == "playing":
@@ -3860,10 +4253,10 @@ def update_and_draw_playing():
             maybe_spawn_trail_particles(player.rect, player.state)
         if goal_trigger_rect and player.rect.colliderect(goal_trigger_rect):
             state = "level_complete"
-            transition_start = pygame.time.get_ticks()
+            transition_start = _now_ms()
             snd_win.play()
     elif state == "level_complete":
-        if pygame.time.get_ticks() - transition_start > LEVEL_TRANSITION_MS:
+        if _now_ms() - transition_start > LEVEL_TRANSITION_MS:
             if is_replay:
                 end_replay()  # restores the player's real current level; never touches save progress
                 state = "replay_picker"
@@ -3880,102 +4273,189 @@ def update_and_draw_playing():
 
     camera.update(player.rect)
 
-    background.draw(screen, camera.x)
-    for spr in platforms:
-        screen.blit(spr.image, camera.apply(spr.rect))
-    for spr in wind_zones:
-        screen.blit(spr.image, camera.apply(spr.rect))
-    for spr in one_way_platforms:
-        screen.blit(spr.image, camera.apply(spr.rect))
-    for spr in checkpoints:
-        screen.blit(spr.image, camera.apply(spr.rect))
-    for spr in spikes:
-        screen.blit(spr.image, camera.apply(spr.rect))
-    for c in coins:
-        screen.blit(c.image, camera.apply(c.rect))
-    for e in enemies:
-        screen.blit(e.image, camera.apply(e.rect))
-    for shot in projectiles:
-        screen.blit(shot.image, camera.apply(shot.rect))
-    if goal_rect:
-        r = camera.apply(goal_rect)
-        pygame.draw.rect(screen, (150, 120, 60), (r.centerx - 3, r.y, 6, r.h))
-        pygame.draw.polygon(
-            screen, GOAL_COLOR,
-            [(r.centerx + 3, r.y), (r.centerx + 19, r.y + 8), (r.centerx + 3, r.y + 16)],
+
+def draw_playing_frame(alpha=1.0):
+    """Renders the current "playing"/"level_complete" state. `alpha` (0..1, from
+    run_fixed_updates()) is how far the leftover accumulator already is toward a next,
+    not-yet-simulated tick -- see _interp_rect(). alpha=1.0 (the default, used by every
+    direct/standalone caller) means "exactly the latest simulated position," identical to
+    this function's pre-interpolation behavior."""
+    real_cam_x = camera.x
+    if alpha < 1.0:
+        # Temporarily override camera.x to the interpolated value for the duration of
+        # this draw -- every draw call below (including Particle/Popup.draw(), which read
+        # camera.x directly rather than going through camera.apply()) picks it up for
+        # free, and it's restored in the `finally` below so next tick's camera.update()
+        # still lerps from the true, non-interpolated position.
+        camera.x = _lerp(getattr(camera, "_prev_x", real_cam_x), real_cam_x, alpha)
+    try:
+        background.draw(screen, camera.x)
+        for spr in platforms:
+            screen.blit(spr.image, camera.apply(_interp_rect(spr, alpha)))
+        for spr in wind_zones:
+            screen.blit(spr.image, camera.apply(_interp_rect(spr, alpha)))
+        for spr in one_way_platforms:
+            screen.blit(spr.image, camera.apply(_interp_rect(spr, alpha)))
+        for spr in checkpoints:
+            screen.blit(spr.image, camera.apply(_interp_rect(spr, alpha)))
+        for spr in spikes:
+            screen.blit(spr.image, camera.apply(_interp_rect(spr, alpha)))
+        for c in coins:
+            screen.blit(c.image, camera.apply(_interp_rect(c, alpha)))
+        for e in enemies:
+            screen.blit(e.image, camera.apply(_interp_rect(e, alpha)))
+        for shot in projectiles:
+            screen.blit(shot.image, camera.apply(_interp_rect(shot, alpha)))
+        if goal_rect:
+            r = camera.apply(goal_rect)
+            pygame.draw.rect(screen, (150, 120, 60), (r.centerx - 3, r.y, 6, r.h))
+            pygame.draw.polygon(
+                screen, GOAL_COLOR,
+                [(r.centerx + 3, r.y), (r.centerx + 19, r.y + 8), (r.centerx + 3, r.y + 16)],
+            )
+
+        now = _now_ms()
+        player_render_rect = _interp_rect(player, alpha)
+        player_visible = True
+        if player.state == "dead":
+            player_visible = (now // 100) % 2 == 0
+        elif now < player.invincible_until:
+            # quick flash while the post-shield-hit grace period is active, so it's obvious
+            # you got hit (and briefly can't be hit again) instead of the damage being silent
+            player_visible = (now // 80) % 2 == 0
+        if player_visible:
+            img_rect = player.image.get_rect(midbottom=player_render_rect.midbottom)
+            screen.blit(player.image, camera.apply(img_rect))
+        if player.state == "dead":
+            overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            overlay.fill((200, 30, 30, 80))
+            screen.blit(overlay, (0, 0))
+
+        for p in particles:
+            p.draw(screen, camera)
+        for p in popups:
+            p.draw(screen, camera, small_font)
+        draw_enemy_radar(screen, enemies, player.rect, camera, spikes, platforms)
+
+        hud_y = 10
+        score_surf = draw_hud_text(screen, f"Score: {score}", (10, hud_y))
+        hud_y += score_surf.get_height() + 6
+        coins_surf = draw_hud_text(screen, f"Coins: {wallet}", (10, hud_y), color=COIN_COLOR)
+        hud_y += coins_surf.get_height() + 6
+        if player.shield_max > 0:
+            shield_surf = draw_hud_text(
+                screen, f"Shield: {player.shield_charges}/{player.shield_max}", (10, hud_y), color=(120, 200, 255)
+            )
+            hud_y += shield_surf.get_height() + 6
+        if player.hearts_max > 0:
+            hearts_surf = draw_hud_text(
+                screen, f"Hearts: {player.hearts}/{player.hearts_max}", (10, hud_y), color=(255, 110, 110)
+            )
+            hud_y += hearts_surf.get_height() + 6
+        if upgrades["dash"] > 0:
+            cooldown_left = max(0, player.dash_ready_time - now)
+            dash_color = (120, 220, 255) if cooldown_left == 0 else (110, 110, 130)
+            dash_text = "Dash: Ready" if cooldown_left == 0 else f"Dash: {cooldown_left / 1000:.1f}s"
+            dash_surf = draw_hud_text(screen, dash_text, (10, hud_y), color=dash_color)
+            hud_y += dash_surf.get_height() + 6
+        if muted:
+            draw_hud_text(screen, "MUTED", (10, hud_y), color=(255, 120, 120))
+        top_right_y = draw_fps_overlay()
+        level_label = f"REPLAY: Level {replay_level}" if is_replay else f"Level {level_num}"
+        level_surf = small_font.render(level_label, True, (255, 190, 90) if is_replay else WHITE)
+        draw_hud_text(screen, level_surf, (SCREEN_W - level_surf.get_width() - 10, top_right_y))
+        hud_surf = small_font.render(
+            "Move: Arrows/WASD  Jump: Space/Up  Shift: Dash  Down: Glide  M: Mute  F3: FPS  F11: Full  Esc: Menu",
+            True, WHITE,
         )
+        draw_hud_text(screen, hud_surf, (10, SCREEN_H - hud_surf.get_height() - 8))
 
-    now = pygame.time.get_ticks()
-    player_visible = True
-    if player.state == "dead":
-        player_visible = (now // 100) % 2 == 0
-    elif now < player.invincible_until:
-        # quick flash while the post-shield-hit grace period is active, so it's obvious
-        # you got hit (and briefly can't be hit again) instead of the damage being silent
-        player_visible = (now // 80) % 2 == 0
-    if player_visible:
-        img_rect = player.image.get_rect(midbottom=player.rect.midbottom)
-        screen.blit(player.image, camera.apply(img_rect))
-    if player.state == "dead":
-        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        overlay.fill((200, 30, 30, 80))
-        screen.blit(overlay, (0, 0))
+        if state == "level_complete":
+            text_surf = font.render(f"Level {level_num} complete!", True, WHITE)
+            draw_hud_text(screen, text_surf, text_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2)).topleft,
+                           pad=10)
 
-    for p in particles:
-        p.draw(screen, camera)
-    for p in popups:
-        p.draw(screen, camera, small_font)
-    draw_enemy_radar(screen, enemies, player.rect, camera, spikes, platforms)
+        pygame.display.flip()
+    finally:
+        camera.x = real_cam_x
 
-    hud_y = 10
-    score_surf = draw_hud_text(screen, f"Score: {score}", (10, hud_y))
-    hud_y += score_surf.get_height() + 6
-    coins_surf = draw_hud_text(screen, f"Coins: {wallet}", (10, hud_y), color=COIN_COLOR)
-    hud_y += coins_surf.get_height() + 6
-    if player.shield_max > 0:
-        shield_surf = draw_hud_text(
-            screen, f"Shield: {player.shield_charges}/{player.shield_max}", (10, hud_y), color=(120, 200, 255)
-        )
-        hud_y += shield_surf.get_height() + 6
-    if player.hearts_max > 0:
-        hearts_surf = draw_hud_text(
-            screen, f"Hearts: {player.hearts}/{player.hearts_max}", (10, hud_y), color=(255, 110, 110)
-        )
-        hud_y += hearts_surf.get_height() + 6
-    if upgrades["dash"] > 0:
-        cooldown_left = max(0, player.dash_ready_time - now)
-        dash_color = (120, 220, 255) if cooldown_left == 0 else (110, 110, 130)
-        dash_text = "Dash: Ready" if cooldown_left == 0 else f"Dash: {cooldown_left / 1000:.1f}s"
-        dash_surf = draw_hud_text(screen, dash_text, (10, hud_y), color=dash_color)
-        hud_y += dash_surf.get_height() + 6
-    if muted:
-        draw_hud_text(screen, "MUTED", (10, hud_y), color=(255, 120, 120))
-    top_right_y = draw_fps_overlay()
-    level_label = f"REPLAY: Level {replay_level}" if is_replay else f"Level {level_num}"
-    level_surf = small_font.render(level_label, True, (255, 190, 90) if is_replay else WHITE)
-    draw_hud_text(screen, level_surf, (SCREEN_W - level_surf.get_width() - 10, top_right_y))
-    hud_surf = small_font.render(
-        "Move: Arrows/WASD  Jump: Space/Up  Shift: Dash  Down: Glide  M: Mute  F3: FPS  F11: Full  Esc: Menu",
-        True, WHITE,
-    )
-    draw_hud_text(screen, hud_surf, (10, SCREEN_H - hud_surf.get_height() - 8))
 
-    if state == "level_complete":
-        text_surf = font.render(f"Level {level_num} complete!", True, WHITE)
-        draw_hud_text(screen, text_surf, text_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2)).topleft, pad=10)
+def update_and_draw_playing(alpha=1.0):
+    """Runs exactly one fixed tick, then draws -- the pre-fixed-timestep behavior, kept
+    as the direct/standalone entry point every existing test (and any other one-off
+    caller) already relies on. game_loop() itself calls _update_playing_tick() (zero or
+    more times, via run_fixed_updates()) and draw_playing_frame() separately instead of
+    going through this, so a real session's tick rate stays decoupled from its render
+    rate -- see the fixed-timestep comment near SIM_HZ."""
+    _snapshot_render_positions()
+    _update_playing_tick()
+    draw_playing_frame(alpha)
 
-    pygame.display.flip()
+
+def run_fixed_updates(frame_time_ms):
+    """Advances the fixed-tick simulation to absorb `frame_time_ms` of newly-elapsed real
+    time, running _update_playing_tick() zero or more times -- see the fixed-timestep
+    architecture comment near SIM_HZ. Returns the render alpha (0..1) draw_playing_frame()
+    should interpolate with: how far the leftover accumulator already is toward a next,
+    not-yet-simulated tick.
+
+    frame_time_ms is clamped to MAX_CATCHUP_TICKS worth of ticks before being added to
+    the accumulator -- the classic fixed-timestep "spiral of death" guard, so a huge
+    one-off stall (window drag, breakpoint, a slow asset load) can't make the game try to
+    frantically replay minutes of missed time; any backlog beyond the cap is simply
+    dropped, same as pausing briefly would look from the player's perspective.
+
+    Stops early if a tick changes `state` away from "playing"/"level_complete" (e.g.
+    reaching the goal, and then the level-complete banner expiring into the replay
+    picker, both within the same rendered frame's catch-up burst) -- whatever's left in
+    the accumulator simply carries over, harmless since it's always well under one
+    rendered frame's worth of real time."""
+    global _accumulator_ms, _tick_time_offset_ms
+
+    _accumulator_ms = min(_accumulator_ms + frame_time_ms, MAX_CATCHUP_TICKS * SIM_DT_MS)
+    ticks_run = 0
+    # `- _TICK_EPSILON_MS`: repeatedly subtracting SIM_DT_MS (itself 1000/60, not exactly
+    # representable in binary) accumulates float error, which can leave the accumulator a
+    # few 1e-13ms *short* of a full tick that mathematically already completed --
+    # dropping it entirely would silently lose ~1/60s of simulated time. The epsilon is
+    # many orders of magnitude below any real timing granularity (clock.tick() reports
+    # whole milliseconds), so it never causes an extra tick to run early.
+    while _accumulator_ms >= SIM_DT_MS - _TICK_EPSILON_MS and state in ("playing", "level_complete"):
+        if ticks_run > 0:
+            # Space this tick's _now_ms() reads SIM_DT_MS apart from the previous one in
+            # this same burst -- see _now_ms()'s docstring for why that matters.
+            _tick_time_offset_ms += SIM_DT_MS
+        _snapshot_render_positions()
+        _update_playing_tick()
+        _accumulator_ms -= SIM_DT_MS
+        ticks_run += 1
+    return _accumulator_ms / SIM_DT_MS
 
 
 def game_loop(max_frames=None):
     """The main loop. With max_frames=None this runs until the player quits (normal
     play); with a number, it stops after that many frames regardless -- used by the
-    --smoke-test CLI mode and by tests to run a bounded slice of real gameplay."""
-    global running
+    --smoke-test CLI mode and by tests to run a bounded slice of real gameplay.
+
+    Rendering happens once per iteration of this loop, paced by fps_cap (see Settings;
+    0 means uncapped) via clock.tick(). Gameplay simulation is entirely decoupled from
+    that -- see run_fixed_updates()/_update_playing_tick() -- so how fast this loop spins
+    only ever changes visual smoothness and input latency, never game speed. "frame" below
+    always means one iteration of this loop (one handle_events() + one render), the same
+    thing max_frames counts and always has -- not one fixed simulation tick, which may
+    happen zero, one, or several times within a given frame."""
+    global running, _accumulator_ms, _tick_time_offset_ms
+
+    # Fresh session: neither a stale reading from however long ago the caller last
+    # touched `clock` (harmless either way -- run_fixed_updates() clamps it -- but no
+    # reason to carry it forward) nor a leftover catch-up offset should bleed in.
+    clock.tick()
+    _accumulator_ms = 0.0
+    _tick_time_offset_ms = 0.0
 
     frame_count = 0
     while running and (max_frames is None or frame_count < max_frames):
-        clock.tick(60)
+        frame_time_ms = clock.tick(fps_cap)
         frame_count += 1
 
         handle_events()
@@ -4002,7 +4482,13 @@ def game_loop(max_frames=None):
             draw_paused_settings()
             continue
 
-        update_and_draw_playing()
+        alpha = run_fixed_updates(frame_time_ms)
+        if state in ("playing", "level_complete"):
+            draw_playing_frame(alpha)
+        # else: a tick this frame moved to some other state (see run_fixed_updates()'s
+        # docstring) -- skip drawing this iteration; the next one's dispatch above
+        # handles it, at most one frame (well under a millisecond at any real FPS cap)
+        # later than it otherwise would have.
 
 
 def parse_args(argv=None):
@@ -4024,6 +4510,11 @@ def main(argv=None):
     init_pygame()
     init_sounds()
     init_sprites()
+    if not args.smoke_test:
+        # Skipped in --smoke-test mode -- it must stay deterministic/non-interactive for
+        # CI regardless of how many save*.txt files happen to sit next to main.py (e.g.
+        # a developer's own working copy while testing this very feature).
+        choose_save_file()
     init_game_state()
 
     try:
@@ -4040,3 +4531,8 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+    if "--smoke-test" not in sys.argv:
+        # Keeps a double-clicked packaged .exe's console window open instead of
+        # vanishing instantly -- skipped in --smoke-test (CI/automated, non-interactive
+        # stdin) mode so that keeps working headlessly.
+        input("press enter to exit")
