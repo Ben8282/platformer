@@ -20,11 +20,13 @@ import math
 import os
 import random
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pygame
+from pygame._sdl2 import touch as sdl2_touch
 
 # ---------------- paths ----------------
 # Resolve every file path relative to this script, not the current working
@@ -77,7 +79,11 @@ def _app_dir():
     return BASE_DIR
 
 
-SAVE_FILE = str(_app_dir() / "save.txt")  # next to the real .exe once packaged -- see _app_dir()
+LEGACY_SAVE_FILE = str(_app_dir() / "save.txt")  # pre-save-slots single save -- see
+                                                  # _needs_legacy_migration() in the save-slots section
+# SAVE_FILE (the ACTIVE slot's path) and active_slot are (re)defined further down, right
+# after _slot_path() -- see that section for why (needs _app_dir()'s directory, computed
+# without ever touching the filesystem just by importing this module).
 
 # ---------------- core constants ----------------
 TS = 40  # tile size in pixels
@@ -1631,6 +1637,33 @@ class RareCoin(Coin):
         self.rect.y = self.base_rect.y + int(3 * math.sin(self.t))
 
 
+_PARTICLE_SURF_CACHE = {}  # (shape, color, size, alpha_bucket) -> pre-rendered Surface, see _particle_surface()
+
+
+def _particle_surface(shape, color, size, alpha):
+    """The little fading dot/square/ring Particle.draw() blits, built once per distinct
+    (shape, color, size, alpha_bucket) combo and reused after that instead of allocating a
+    fresh Surface for every particle on every single frame -- with dozens of particles
+    alive at once during a coin burst or a trail, that added up to real per-frame
+    allocation + pygame.draw work for something that only actually varies in a handful of
+    ways. Alpha is bucketed to 16 steps (not the full 0..255) since a fade lasting several
+    hundred ms never needs finer-than-that transparency granularity to look smooth, and it
+    keeps the cache from growing one entry per single frame of every particle's lifetime."""
+    alpha_bucket = (alpha // 16) * 16
+    key = (shape, color, size, alpha_bucket)
+    surf = _PARTICLE_SURF_CACHE.get(key)
+    if surf is None:
+        surf = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
+        if shape == "square":
+            pygame.draw.rect(surf, (*color, alpha_bucket), (0, 0, size * 2, size * 2))
+        elif shape == "ring":
+            pygame.draw.circle(surf, (*color, alpha_bucket), (size, size), size, width=max(1, size // 2))
+        else:
+            pygame.draw.circle(surf, (*color, alpha_bucket), (size, size), size)
+        _PARTICLE_SURF_CACHE[key] = surf
+    return surf
+
+
 class Particle:
     """`shape` picks how draw() renders the fading dot: "circle" (default, used by every
     combat/pickup effect and the original 3 trail styles), "square" (Confetti trail), or
@@ -1659,13 +1692,7 @@ class Particle:
         age = (_now_ms() - self.spawn_time) / self.life
         alpha = max(0, 255 - int(255 * age))
         size = max(1, int(4 * (1 - age)))
-        s = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
-        if self.shape == "square":
-            pygame.draw.rect(s, (*self.color, alpha), (0, 0, size * 2, size * 2))
-        elif self.shape == "ring":
-            pygame.draw.circle(s, (*self.color, alpha), (size, size), size, width=max(1, size // 2))
-        else:
-            pygame.draw.circle(s, (*self.color, alpha), (size, size), size)
+        s = _particle_surface(self.shape, self.color, size, alpha)
         screen_x = self.x - camera.x + camera.shake_ox - size
         screen_y = self.y + camera.shake_oy - size
         surf.blit(s, (screen_x, screen_y))
@@ -1760,6 +1787,23 @@ def render_text_fit(font, text, color, max_width):
     return pygame.transform.smoothscale(surf, new_size)
 
 
+_HUD_TEXT_BG_CACHE = {}  # (w, h) -> pre-filled translucent backing Surface, see draw_hud_text()
+
+
+def _hud_text_bg(w, h):
+    """The translucent dark rectangle draw_hud_text() sits every HUD label on, cached by
+    its pixel size instead of allocated and filled fresh every call -- this runs several
+    times a frame (score/coins/level/timer, ...) and the actual set of distinct label
+    sizes in play at once is small, so the cache stays small too."""
+    key = (w, h)
+    bg = _HUD_TEXT_BG_CACHE.get(key)
+    if bg is None:
+        bg = pygame.Surface((w, h), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 140))
+        _HUD_TEXT_BG_CACHE[key] = bg
+    return bg
+
+
 def draw_hud_text(surf, text, pos, pad=4, font=None, color=WHITE):
     """Blit HUD text on a translucent dark backing so it stays readable over any
     background (white text on a white cloud is otherwise invisible). `text` may be a
@@ -1767,8 +1811,7 @@ def draw_hud_text(surf, text, pos, pad=4, font=None, color=WHITE):
     Surface for callers that need to measure it before choosing where to place it.
     Either way, the rendered Surface is returned so the caller can query its size."""
     text_surf = (font or small_font).render(text, True, color) if isinstance(text, str) else text
-    bg = pygame.Surface((text_surf.get_width() + pad * 2, text_surf.get_height() + pad * 2), pygame.SRCALPHA)
-    bg.fill((0, 0, 0, 140))
+    bg = _hud_text_bg(text_surf.get_width() + pad * 2, text_surf.get_height() + pad * 2)
     surf.blit(bg, (pos[0] - pad, pos[1] - pad))
     surf.blit(text_surf, pos)
     return text_surf
@@ -2523,10 +2566,28 @@ def _draw_touch_icon(surf, kind, cx, cy, r, color):
         _draw_touch_icon(surf, "right" if state == "paused" else "pause", cx, cy, r, color)
 
 
+PAUSE_TOGGLE_DEBOUNCE_MS = 300  # see _toggle_pause()
+_last_pause_toggle_ms = -PAUSE_TOGGLE_DEBOUNCE_MS
+
+
 def _toggle_pause():
     """The Esc key and the touch overlay's Pause button both go through this, so the two
-    input methods can never end up with a different idea of what pausing does."""
-    global state
+    input methods can never end up with a different idea of what pausing does.
+
+    Debounced: a toggle is a bad shape for anything that might fire twice for what was
+    meant as one press -- unlike Jump or Dash (where a duplicate press just repeats a
+    harmless action), a duplicate pause toggle flips state, then immediately flips it
+    right back, so the player sees nothing happen at all and reasonably concludes the
+    button doesn't work. Real touchscreens occasionally do produce a spurious extra
+    FINGERDOWN for a single physical tap (digitizer jitter, or a touch landing right as
+    the previous one is still resolving), so this is defending against real hardware, not
+    a hypothetical. 300ms is far longer than any deliberate double-press of a pause
+    button would ever need to be, so it costs nothing for normal use."""
+    global state, _last_pause_toggle_ms
+    now = _now_ms()
+    if now - _last_pause_toggle_ms < PAUSE_TOGGLE_DEBOUNCE_MS:
+        return
+    _last_pause_toggle_ms = now
     if state == "playing":
         state = "paused"
     elif state == "paused":
@@ -2580,15 +2641,31 @@ class TouchButton:
         (cx, cy), r = self.center_radius(swap_sides, scale, margin)
         return (pos[0] - cx) ** 2 + (pos[1] - cy) ** 2 <= r * r
 
-    def draw(self, surf, swap_sides, scale, margin):
+    def draw(self, surf, swap_sides, scale, margin, alpha255):
+        # Drawn onto a small local surface sized to just this button (not the full
+        # SCREEN_W x SCREEN_H overlay this used to share with every other button) and
+        # alpha-blended onto `surf` right here -- profiling showed the overlay's own
+        # per-pixel alpha blit (not allocating it) was the real per-frame cost, and that
+        # scales with blit area: one full-screen blit touches ~350k pixels every frame
+        # buttons are visible (i.e. most of gameplay on a touch device) to composite six
+        # circles that together cover a small fraction of that. Buttons never overlap
+        # each other by layout (see TouchControls.__init__), so blending them onto `surf`
+        # one at a time here instead of onto a shared transparent layer first is visually
+        # identical -- nothing to alpha-blend against but the already-drawn world either way.
         (cx, cy), r = self.center_radius(swap_sides, scale, margin)
         cx, cy, r = round(cx), round(cy), round(r)
         pressed = self.held
-        pygame.draw.circle(surf, (18, 16, 26, 165), (cx, cy), r)
+        pad = 4  # headroom so the 3px ring stroke never clips the local surface's edge
+        size = r * 2 + pad * 2
+        local = pygame.Surface((size, size), pygame.SRCALPHA)
+        lc = r + pad
+        pygame.draw.circle(local, (18, 16, 26, 165), (lc, lc), r)
         ring_color = tuple(min(255, c + 60) for c in self.color) if pressed else self.color
-        pygame.draw.circle(surf, (*ring_color, 235), (cx, cy), r, 0 if pressed else 3)
+        pygame.draw.circle(local, (*ring_color, 235), (lc, lc), r, 0 if pressed else 3)
         icon_color = (15, 12, 22) if pressed else ring_color
-        _draw_touch_icon(surf, self.icon, cx, cy, r, icon_color)
+        _draw_touch_icon(local, self.icon, lc, lc, r, icon_color)
+        local.set_alpha(alpha255)
+        surf.blit(local, (cx - lc, cy - lc))
 
 
 class TouchControls:
@@ -2606,6 +2683,12 @@ class TouchControls:
         self.opacity = 0.8       # Settings' Touch Opacity slider, 0..1
         self.size = 1.0          # Settings' Touch Size slider, mapped into TOUCH_SIZE_MIN..MAX
         self.swap_sides = False  # Settings' Swap Sides toggle
+        # Every finger currently touching the screen, anywhere -- not just the ones over a
+        # TouchButton (see on_finger_down()/on_finger_up()). draw_paused_settings() checks
+        # this before actually applying a fullscreen switch from the Settings screen's
+        # Fullscreen toggle -- see that check for why.
+        self.active_fingers = set()
+        self._touch_id = None  # which touch device active_fingers/button.fingers belong to -- see update()
 
         self.btn_left = TouchButton("left", 56, 70, 36, "left", keys=(pygame.K_LEFT,),
                                      color=(0, 200, 255))
@@ -2618,12 +2701,17 @@ class TouchControls:
                                      is_active=lambda: upgrades["dash"] > 0)
         self.btn_glide = TouchButton("right", 140, 36, 26, "down", keys=(pygame.K_DOWN,),
                                       color=(170, 220, 140), is_active=lambda: upgrades["glide"] > 0)
-        # Bigger than every other button (a mis-tap here is far more disruptive than one
-        # on Left/Right) and it's the one button that stays reachable through "paused" too
-        # -- see _buttons_for_state() and _draw_touch_icon()'s "pause_toggle" case. dy/
-        # radius are tuned to clear the "PAUSED" title (title_font, centered at y=70,
-        # its rendered rect top lands at y=48) with a few px to spare.
-        self.btn_pause = TouchButton("top", 0, 16, 20, "pause_toggle", on_press=_toggle_pause,
+        # A mis-tap (or a missed tap) here is far more disruptive than on any other
+        # button, and it's the one button that stays reachable through "paused" too --
+        # see _buttons_for_state() and _draw_touch_icon()'s "pause_toggle" case. radius is
+        # as large as it can be while still clearing the "PAUSED" title underneath it
+        # (title_font, centered at y=70, its rendered rect top lands at y=48) with a
+        # couple px to spare; dy is deliberately less than radius so the circle's top
+        # bleeds a few px past the actual screen edge rather than shrinking the button
+        # further to stay fully inside TOUCH_SAFE_MARGIN -- a slightly-off-screen top
+        # sliver costs nothing (there's nothing to mis-tap up there), while every extra px
+        # of radius directly grows the real, on-screen tappable area.
+        self.btn_pause = TouchButton("top", 0, 16, 24, "pause_toggle", on_press=_toggle_pause,
                                       color=(255, 210, 90))
         self.buttons = [self.btn_left, self.btn_right, self.btn_jump, self.btn_dash,
                          self.btn_glide, self.btn_pause]
@@ -2650,6 +2738,8 @@ class TouchControls:
     def on_finger_down(self, event):
         self.ever_touched = True
         self.last_touch_ms = _now_ms()
+        self._touch_id = event.touch_id
+        self.active_fingers.add(event.finger_id)
         pos = _finger_event_logical_pos(event)
         for b in self._buttons_for_state():
             if b.contains(pos, self.swap_sides, self.size, TOUCH_SAFE_MARGIN):
@@ -2659,17 +2749,46 @@ class TouchControls:
 
     def on_finger_up(self, event):
         self.last_touch_ms = _now_ms()
+        self.active_fingers.discard(event.finger_id)
         for b in self.buttons:
             b.fingers.discard(event.finger_id)
 
     def on_finger_motion(self, event):
         self.last_touch_ms = _now_ms()
+        self._touch_id = event.touch_id
+
+    def _reconcile_active_fingers(self):
+        """Force-clear any finger our own bookkeeping thinks is still down but the OS no
+        longer reports as touching -- a safety net for a dropped/missed FINGERUP, which is
+        exactly what turns into "the button gets stuck held / stops responding until I
+        restart" after a lot of rapid tapping (real touchscreen drivers do occasionally
+        drop an up event under bursty input; nothing in on_finger_up() would ever run to
+        clear it otherwise, since there's nothing left to generate that event). Cheap and
+        self-healing: runs every frame, and pygame._sdl2.touch.get_finger() is the same
+        query a fresh FINGERDOWN would've been checked against, just asked directly
+        instead of waited for. Wrapped defensively -- this is a belt-and-suspenders check
+        on top of the normal event-driven path, never the only way fingers get cleared, so
+        if it can't run on some platform/SDL build it's skipped rather than fatal."""
+        if self._touch_id is None or not self.active_fingers:
+            return
+        try:
+            n = sdl2_touch.get_num_fingers(self._touch_id)
+            really_down = {sdl2_touch.get_finger(self._touch_id, i)["id"] for i in range(n)}
+        except Exception:
+            return
+        stale = self.active_fingers - really_down
+        if not stale:
+            return
+        self.active_fingers -= stale
+        for b in self.buttons:
+            b.fingers -= stale
 
     def update(self, dt_ms):
         """Advance the fade timer -- called once per rendered frame regardless of game
         state, so a touch anywhere (even in a menu) starts the fade-in, and a hybrid
         device keeps counting down toward hiding again even on frames where the overlay
         itself isn't drawn."""
+        self._reconcile_active_fingers()
         if not self.ever_touched:
             self._alpha = 0.0
             return
@@ -2690,11 +2809,9 @@ class TouchControls:
         eff = self.effective_alpha()
         if not buttons or eff <= 0.01:
             return
-        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        alpha255 = round(255 * eff)
         for b in buttons:
-            b.draw(overlay, self.swap_sides, self.size, TOUCH_SAFE_MARGIN)
-        overlay.set_alpha(round(255 * eff))
-        surf.blit(overlay, (0, 0))
+            b.draw(surf, self.swap_sides, self.size, TOUCH_SAFE_MARGIN, alpha255)
 
 
 def build_menu_background():
@@ -2862,6 +2979,8 @@ SAVE_DEFAULTS = {
     "touch_opacity": 80, "touch_size": 50, "touch_swap_sides": 0,
     "touch_ever_used": 0,  # sticky flag: once a real touch is seen, Settings keeps showing
                            # the touch rows even after restarting with no keyboard/mouse used
+    "slot_name": "",       # the only non-int field -- see load_save()'s parse loop
+    "playtime_seconds": 0, "last_played": 0,  # save-slot metadata -- see _update_playing_tick()
 }
 SAVE_DEFAULTS.update({f"upg_{key}": 0 for key in UPGRADE_DEFAULTS})
 SAVE_DEFAULTS.update({f"trail_owned_{key}": 0 for key in TRAIL_DEFAULTS})
@@ -2907,15 +3026,32 @@ def _clamp_save_data(data):
     data["touch_size"] = _clamp(data.get("touch_size", 50), 0, 100)
     data["touch_swap_sides"] = 1 if data.get("touch_swap_sides", 0) else 0
     data["touch_ever_used"] = 1 if data.get("touch_ever_used", 0) else 0
+    data["slot_name"] = _sanitize_slot_name(data.get("slot_name", ""))
+    data["playtime_seconds"] = max(0, data.get("playtime_seconds", 0))
+    data["last_played"] = max(0, data.get("last_played", 0))
     return data
 
 
+SLOT_NAME_MAX_LEN = 40
+
+
+def _sanitize_slot_name(name):
+    """The one free-text field the otherwise all-int save format holds (see
+    load_save()'s parse loop) -- newlines would break the one-field-per-line format, so
+    they're stripped, and length is capped so a save-slot row never has to wrap or
+    overflow. Shared by _clamp_save_data() (defends against a hand-edited/corrupted
+    file) and rename_slot() (defends against whatever the player just typed)."""
+    return str(name).replace("\n", " ").replace("\r", " ").strip()[:SLOT_NAME_MAX_LEN]
+
+
 def load_save(path=None):
-    """Read a save file into a dict of int fields, tolerating a missing file, unreadable
-    file, or individual corrupted/garbage lines -- always returns a complete, validated
-    dict (every SAVE_DEFAULTS key present, every value in its safe range). Defaults to
-    the currently-configured SAVE_FILE; choose_save_file() passes an explicit `path` to
-    preview *other* save slots without switching the game to them."""
+    """Read a save file into a dict of int fields (plus the one string field, slot_name),
+    tolerating a missing file, unreadable file, or individual corrupted/garbage lines --
+    always returns a complete, validated dict (every SAVE_DEFAULTS key present, every
+    value in its safe range). Defaults to the currently-configured SAVE_FILE (the active
+    slot); _peek_slot() passes an explicit `path` to preview *other* slots without
+    switching to them -- unlike this function, it returns None for a missing file instead
+    of auto-creating one, since "does this slot exist" is exactly what it needs to know."""
     if path is None:
         path = SAVE_FILE
     data = dict(SAVE_DEFAULTS)
@@ -2933,15 +3069,23 @@ def load_save(path=None):
     saw_stat_coins = False
     for line in lines:
         key, _, value = line.strip().partition("=")
-        if key in data:
-            try:
-                data[key] = int(value)
-                if key == "save_version":
-                    saw_save_version = True
-                elif key == "stat_coins":
-                    saw_stat_coins = True
-            except ValueError:
-                pass
+        if key not in data:
+            continue
+        if key == "slot_name":
+            # The one field that's genuinely text, not an int like everything else --
+            # partition() (not split()) means an "=" inside the name itself is still
+            # safe, only a newline would break the one-field-per-line format, and that's
+            # already impossible here since `line` was read one line at a time.
+            data[key] = value
+            continue
+        try:
+            data[key] = int(value)
+            if key == "save_version":
+                saw_save_version = True
+            elif key == "stat_coins":
+                saw_stat_coins = True
+        except ValueError:
+            pass
     data = _clamp_save_data(data)
     # equipped_trail_id is a *position* in TRAILS, and that table was reordered in
     # save_version 5 (see SAVE_VERSION's comment) -- a save from before that point has a
@@ -2966,6 +3110,7 @@ def write_save(data, path=None):
     # crash or power loss mid-write can never leave the save file half-written/corrupted
     if path is None:
         path = SAVE_FILE
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)  # saves/ may not exist yet
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as f:
         for key, value in data.items():
@@ -2998,6 +3143,9 @@ def save_game():
         "touch_size": round((touch_controls.size - TOUCH_SIZE_MIN) / (TOUCH_SIZE_MAX - TOUCH_SIZE_MIN) * 100),
         "touch_swap_sides": int(touch_controls.swap_sides),
         "touch_ever_used": int(touch_controls.ever_touched),
+        "slot_name": slot_name,
+        "playtime_seconds": playtime_seconds,
+        "last_played": int(time.time()),
     }
     data.update({f"upg_{key}": lvl for key, lvl in upgrades.items()})
     data.update({f"trail_owned_{key}": 1 if key in owned_trails else 0 for key in TRAIL_DEFAULTS})
@@ -3009,62 +3157,133 @@ _dirty = False
 _last_autosave = 0
 
 
-# ---------------- multiple save files ----------------
-def _is_save_filename(name):
-    """True for "save.txt" or "save<digits>.txt" specifically (not e.g.
-    "saved_settings.txt" or "savegame.txt.bak") -- only genuine save slots should ever
-    show up in the picker below."""
-    if not (name.startswith("save") and name.endswith(".txt")):
-        return False
-    middle = name[len("save"):-len(".txt")]
-    return middle == "" or middle.isdigit()
+# ---------------- save slots ----------------
+# Each slot is a complete, independent game (level/coins/upgrades/cosmetics/stats/its own
+# settings) in the existing key=value format -- a save slot is not a new file format, just
+# NUM_SAVE_SLOTS fixed files in their own folder instead of one flat save.txt. SAVE_FILE
+# keeps meaning exactly what it always has ("the file load_save()/write_save()/save_game()
+# read from and write to"), it's just reassigned by activate_slot() when the player picks
+# a different slot instead of being fixed for the whole process.
+NUM_SAVE_SLOTS = 6  # matches SHOP_ROWS_PER_PAGE, so the slot list needs no pagination
 
 
-def _save_slot_sort_key(filename):
-    digits = filename[len("save"):-len(".txt")]
-    return int(digits) if digits else 0  # "save.txt" (no digits) always sorts first
+def _saves_dir():
+    """Directory every save slot lives in. Deliberately does NOT create it -- computing a
+    path (which happens just by importing this module, e.g. from a test) must never touch
+    the filesystem. write_save() creates it lazily on first actual write (see there)."""
+    return os.path.join(os.path.dirname(LEGACY_SAVE_FILE) or ".", "saves")
 
 
-def _discover_save_files():
-    """Every save*.txt file sitting next to the currently-configured SAVE_FILE (same
-    directory) -- lets one shared build/install support independent save slots with zero
-    configuration: drop another save1.txt, save2.txt, ... next to save.txt and
-    choose_save_file() offers a picker automatically. Returns a sorted list of full paths;
-    empty or single-item lists (the overwhelmingly common case, including every brand new
-    install with no save yet) mean there's nothing to choose between."""
-    save_dir = os.path.dirname(SAVE_FILE) or "."
-    if not os.path.isdir(save_dir):
-        return []
-    names = sorted((n for n in os.listdir(save_dir) if _is_save_filename(n)), key=_save_slot_sort_key)
-    return [os.path.join(save_dir, n) for n in names]
+def _slot_path(n):
+    return os.path.join(_saves_dir(), f"slot{n}.save")
 
 
-def _backup_dir():
-    """Where backup_save() (and nothing else) writes to -- a subfolder next to the real
-    save file, deliberately never scanned by _discover_save_files(). An earlier version
-    of this feature wrote save<N>.txt directly next to save.txt, which meant every backup
-    immediately became a second selectable slot in choose_save_file()'s "multiple save
-    files found" picker at the next launch -- confusing at best (why is the game asking
-    which save to play?), and at worst an easy way to accidentally launch into a stale
-    backup instead of your real progress. Backups now live somewhere that picker never
-    looks, so making one can never change which save the game actually loads."""
-    d = os.path.join(os.path.dirname(SAVE_FILE) or ".", "backups")
-    os.makedirs(d, exist_ok=True)
-    return d
+active_slot = 1
+SAVE_FILE = _slot_path(active_slot)  # the active slot's file -- reassigned by activate_slot()
 
 
-def backup_save():
-    """Duplicates the current save into backups/save_backup_<timestamp>.txt. This is
-    export_save()'s fallback when a native file dialog isn't available (see
-    _tk_file_dialog()) -- there's no tkinter on Android, where this in-place backup is
-    what "export" means instead (see the Help entry for how to bring it back: drop the
-    file into the save folder, as save.txt or any save<N>.txt, before launching).
-    Returns the new path, or None if the copy failed (e.g. a read-only install
-    location)."""
-    save_game()  # flush the very latest state first, not a stale on-disk copy
-    dest = os.path.join(_backup_dir(), f"save_backup_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+def _peek_slot(n):
+    """Like load_save() but returns None for a missing slot instead of creating a default
+    file there -- list_save_slots() needs to tell an empty slot apart from an occupied one
+    without side effects, which load_save()'s auto-create (by design, for the always-must-
+    exist active slot) would defeat."""
+    path = _slot_path(n)
+    if not os.path.exists(path):
+        return None
+    return load_save(path)
+
+
+def list_save_slots():
+    """Metadata for all NUM_SAVE_SLOTS slots -- the Save Slots screen's data source.
+    `data` is None for an empty slot (draw as "New Game"), else the same clamped dict
+    load_save() always returns."""
+    return [{"index": n, "path": _slot_path(n), "data": _peek_slot(n)} for n in range(1, NUM_SAVE_SLOTS + 1)]
+
+
+def activate_slot(n):
+    """Makes slot `n` the active one and reloads the entire game state from it -- a fresh
+    default save is created if the slot was empty (the same auto-create load_save()
+    already does for any missing file). Same reassign-SAVE_FILE-then-reload shape the old
+    multi-file picker and manual Import already used, just promoted to a real entry
+    point."""
+    global active_slot, SAVE_FILE
+    active_slot = n
+    SAVE_FILE = _slot_path(n)
+    init_game_state()
+
+
+def rename_slot(n, new_name):
+    """Renames slot `n` in place -- touches only that one file. If it's the slot
+    currently loaded, also updates the live `slot_name` global so the change shows up
+    immediately without a full reload (same idea as the pause menu's quick Mute toggle
+    keeping its Settings-screen widget in sync -- see PAUSE_MUTE_TOGGLE_RECT)."""
+    global slot_name
+    data = _peek_slot(n)
+    if data is None:
+        return  # nothing to rename -- an empty slot has no file yet
+    data["slot_name"] = _sanitize_slot_name(new_name)
+    write_save(_clamp_save_data(data), _slot_path(n))
+    if n == active_slot:
+        slot_name = data["slot_name"]
+
+
+def duplicate_slot(src, dest):
+    """Copies slot `src` into slot `dest`. The caller (the Duplicate flow) is responsible
+    for only ever offering an EMPTY dest slot -- this function itself has no opinion and
+    will happily overwrite whatever is already at `dest`."""
+    shutil.copy2(_slot_path(src), _slot_path(dest))
+
+
+def delete_slot(n):
+    """Permanently deletes slot `n`'s file. The caller (the Delete flow) is responsible
+    for confirming with the player first -- this function never asks."""
+    path = _slot_path(n)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def _needs_legacy_migration():
+    """True exactly once per install: a pre-slots save.txt exists and saves/ doesn't yet.
+    Existence-based, not content-based, so it can't misjudge a legitimate-but-empty legacy
+    save as "nothing to migrate". saves/ getting created either way the player answers the
+    migration prompt (see _migrate_legacy_save_to_slot1()) is what makes this return False
+    forever after, so the prompt truly only happens once."""
+    return os.path.exists(LEGACY_SAVE_FILE) and not os.path.isdir(_saves_dir())
+
+
+def _migrate_legacy_save_to_slot1():
+    """Copies (never moves/deletes) the pre-slots save.txt into slot 1. In practice only
+    ever runs once (a fresh install always starts with saves/ missing, and this is the
+    only thing that creates it), but copy2() overwriting slot 1 if it somehow already had
+    something is still the correct, safe behavior rather than raising."""
+    os.makedirs(_saves_dir(), exist_ok=True)
+    shutil.copy2(LEGACY_SAVE_FILE, _slot_path(1))
+
+
+# ---------------- export/import dialog plumbing (reused by save slots -- see stage 6) ----------------
+def _backup_slot_file(path):
+    """Duplicates the save file at `path` into backups/save_backup_<timestamp>.txt next
+    to it -- backups/ is never scanned by list_save_slots()/_peek_slot(), so a backup can
+    never be mistaken for a real slot on the Save Slots screen. This is export_slot()'s
+    fallback when a native file dialog isn't available (see _tk_file_dialog()) -- there's
+    no tkinter on Android, where this in-place backup is what "export" means instead (see
+    the Help entry for how to bring it back: copy it into the saves folder as
+    slot<N>.save before launching). Returns the new path, or None if the copy failed
+    (e.g. a read-only install location)."""
+    backups_dir = os.path.join(os.path.dirname(path) or ".", "backups")
+    os.makedirs(backups_dir, exist_ok=True)
+    # time.strftime() only has second resolution -- two backups requested within the same
+    # second (e.g. Export from the action sheet, then again from Advanced Save
+    # Management) would otherwise silently collide on the same filename and the second
+    # would overwrite the first with no error. A numeric suffix disambiguates instead.
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(backups_dir, f"save_backup_{stamp}.txt")
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        dest = os.path.join(backups_dir, f"save_backup_{stamp}_{n}.txt")
     try:
-        shutil.copy2(SAVE_FILE, dest)
+        shutil.copy2(path, dest)
         return dest
     except OSError:
         return None
@@ -3101,38 +3320,98 @@ def _tk_file_dialog(mode, **kwargs):
     return path or None
 
 
-def export_save():
-    """Lets the player export their save to any location/filename they choose via a
-    native file dialog, falling back to backup_save() if tkinter isn't available.
-    Returns a short message for the main menu's toast (see handle_events())."""
-    save_game()
+def export_slot(n):
+    """Lets the player export slot `n` to any location/filename they choose via a native
+    file dialog, falling back to _backup_slot_file() if tkinter isn't available. Flushes
+    first if `n` is the currently active slot, so an export can never be a frame stale.
+    Returns a short message for the calling screen's toast."""
+    path = _slot_path(n)
+    if n == active_slot:
+        save_game()
+    data = _peek_slot(n)
+    default_name = f"{(data['slot_name'] if data else '') or f'slot{n}'}.txt"
     try:
         dest = _tk_file_dialog(
             "save", defaultextension=".txt", filetypes=[("Save files", "*.txt"), ("All files", "*.*")],
-            initialfile="platformer_save.txt", title="Export Save As",
+            initialfile=default_name, title=f"Export Slot {n} As",
         )
     except _FileDialogUnavailable:
-        path = backup_save()
-        return (f"No file dialog available -- saved a backup at backups/{os.path.basename(path)}"
-                if path else "Export failed")
+        backup_path = _backup_slot_file(path)
+        return (f"No file dialog available -- saved a backup at backups/{os.path.basename(backup_path)}"
+                if backup_path else "Export failed")
     if dest is None:
         return "Export cancelled"
     try:
-        shutil.copy2(SAVE_FILE, dest)
-        return f"Exported save to {dest}"
+        shutil.copy2(path, dest)
+        return f"Exported Slot {n} to {dest}"
     except OSError:
         return "Export failed -- couldn't write to that location"
 
 
-def import_save():
-    """Lets the player import a save from any file they choose via a native file dialog,
-    overwriting the current save and reloading the whole game state from it. load_save()
-    tolerates a garbage/non-save file already (see its docstring), so picking the wrong
-    file just lands on mostly-default values instead of crashing. Falls back to a short
-    explanatory message if tkinter isn't available -- there's no tkinter on Android,
-    where dropping the file into the save folder before launching is how importing works
-    instead (see the Help entry)."""
-    global SAVE_FILE
+def _advanced_save_mgmt_is_limited():
+    """True when there's no realistic way to open a native file manager or file dialog --
+    Android (no file-manager integration without native Java/Kotlin interop this pure-
+    pygame project doesn't have) or any desktop Python without tkinter installed
+    (confirmed to actually happen, not just theoretical -- see _tk_file_dialog()).
+    Decides Advanced Save Management's second button: "Open Save Folder" normally, or
+    "Export Save" (the backups/ fallback) when this is True."""
+    if touch_controls.is_android:
+        return True
+    try:
+        import tkinter  # noqa: F401 -- only checking availability, not using it here
+    except Exception:
+        return True
+    return False
+
+
+def open_save_folder():
+    """Opens the OS file manager at the saves folder -- desktop only (see
+    _advanced_save_mgmt_is_limited()). Best-effort: wrapped in try/except so a platform
+    this doesn't work on just returns a message instead of crashing the game."""
+    path = _saves_dir()
+    os.makedirs(path, exist_ok=True)
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+        return f"Opened {path}"
+    except Exception:
+        return f"Couldn't open a file manager -- the saves folder is at {path}"
+
+
+def _try_parse_import_file(path):
+    """Reads `path` as a candidate save file without touching any real slot. Returns a
+    clamped preview dict on success, or None if the file doesn't look like a save at all
+    (zero recognized fields) -- load_save() is already tolerant of PARTIAL corruption
+    (see its docstring), so this only rejects files with NOTHING recognizable, not ones
+    that are merely old or slightly damaged."""
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    recognized = 0
+    for line in lines:
+        key, sep, _value = line.strip().partition("=")
+        if sep and key in SAVE_DEFAULTS:
+            recognized += 1
+    if recognized == 0:
+        return None
+    return load_save(path)  # path exists (we just read it), so this parses -- never auto-creates
+
+
+_pending_import = None  # {"path", "data"} between begin_import() and commit_pending_import()
+
+
+def begin_import():
+    """Opens the native Open dialog and, if a file was picked, validates it -- steps 1-6
+    of the Import wizard (see the "import_preview" state in handle_events()). Returns a
+    short message on failure/cancel (nothing to show yet), or None on success (with
+    _pending_import populated, ready for the "import_preview" screen)."""
+    global _pending_import
     try:
         src = _tk_file_dialog(
             "open", filetypes=[("Save files", "*.txt"), ("All files", "*.*")], title="Import Save",
@@ -3141,81 +3420,92 @@ def import_save():
         return "No file dialog available -- see Help for how to import a save manually"
     if src is None:
         return "Import cancelled"
-    try:
-        shutil.copy2(src, SAVE_FILE)
-    except OSError:
-        return "Import failed -- couldn't read that file"
-    init_game_state()
-    return f"Imported save from {src}"
+    data = _try_parse_import_file(src)
+    if data is None:
+        return "That doesn't look like a save file"
+    _pending_import = {"path": src, "data": data}
+    return None
 
 
-def _save_picker_layout(candidates):
-    """Fixed (path, preview_data, hitbox_rect) rows for the save picker -- computed once
-    (each candidate file is read via load_save() for a level/score/coins preview) instead
-    of every single frame."""
-    rows = []
-    y = 150
-    for path in candidates:
-        data = load_save(path)
-        rect = pygame.Rect(0, 0, 560, 54)
-        rect.center = (SCREEN_W // 2, y)
-        rows.append((path, data, rect))
-        y += 66
-    return rows
+def commit_pending_import(dest_slot):
+    """Writes the previously-validated _pending_import into slot `dest_slot`, replacing
+    whatever was there. Only ever called once the player has confirmed -- either
+    `dest_slot` was empty (nothing to lose), or they answered the Replace Slot N
+    confirmation (see "import_replace_confirm" in handle_events())."""
+    global _pending_import
+    if _pending_import is None:
+        return "Import failed -- nothing pending"
+    write_save(_pending_import["data"], _slot_path(dest_slot))
+    path = _pending_import["path"]
+    _pending_import = None
+    if dest_slot == active_slot:
+        activate_slot(dest_slot)  # reload live state immediately if we just overwrote the active slot
+    return f"Imported {os.path.basename(path)} into Slot {dest_slot}"
 
 
-def _draw_save_picker(rows, mouse_pos):
+def _migration_prompt_layout():
+    yes_rect = pygame.Rect(0, 0, 220, 50)
+    yes_rect.center = (SCREEN_W // 2 - 130, 290)
+    no_rect = pygame.Rect(0, 0, 180, 50)
+    no_rect.center = (SCREEN_W // 2 + 130, 290)
+    return yes_rect, no_rect
+
+
+def _draw_migration_prompt(yes_rect, no_rect, mouse_pos, title_font, body_font):
+    # Local fonts, not the usual global font/small_font -- this runs before
+    # init_game_state() has created those (same reason the picker this replaces did the
+    # same thing). Built once by show_migration_prompt() and passed in, not recreated
+    # here -- this redraws every tick of that screen's own event loop, and SysFont() is a
+    # filesystem font-matching lookup, not something to repeat 30 times a second.
     screen.fill((12, 10, 24))
-    title_surf = pygame.font.SysFont(None, 44).render("MULTIPLE SAVE FILES FOUND", True, (0, 255, 220))
-    screen.blit(title_surf, title_surf.get_rect(center=(SCREEN_W // 2, 60)))
-    sub_font = pygame.font.SysFont(None, 22)
-    sub_surf = sub_font.render("Click a save file to play it", True, (170, 170, 190))
-    screen.blit(sub_surf, sub_surf.get_rect(center=(SCREEN_W // 2, 100)))
+    title_surf = title_font.render("EXISTING SAVE FOUND", True, (0, 255, 220))
+    screen.blit(title_surf, title_surf.get_rect(center=(SCREEN_W // 2, 90)))
+    for i, line in enumerate([
+        "This looks like an older install, from before save slots were added.",
+        "Import your existing progress into Slot 1?",
+        "(Your original save file is kept either way -- nothing is deleted.)",
+    ]):
+        surf = body_font.render(line, True, (200, 200, 220))
+        screen.blit(surf, surf.get_rect(center=(SCREEN_W // 2, 165 + i * 30)))
 
-    row_font = pygame.font.SysFont(None, 26)
-    for path, data, rect in rows:
+    for rect, label, primary in ((yes_rect, "IMPORT INTO SLOT 1", True), (no_rect, "SKIP", False)):
         hovered = rect.collidepoint(mouse_pos)
-        pygame.draw.rect(screen, (58, 84, 82) if hovered else (40, 58, 58), rect, border_radius=8)
-        pygame.draw.rect(screen, (140, 195, 190), rect, 2, border_radius=8)
-        name_surf = row_font.render(os.path.basename(path), True, WHITE)
-        screen.blit(name_surf, (rect.x + 14, rect.y + 6))
-        info_surf = sub_font.render(
-            f"Level {data['level']}   Score {data['score']}   Coins {data['coins']}",
-            True, (170, 200, 198),
-        )
-        screen.blit(info_surf, (rect.x + 14, rect.y + 30))
+        base = (0, 195, 155) if primary else (40, 58, 58)
+        hover = (0, 255, 200) if primary else (58, 84, 82)
+        pygame.draw.rect(screen, hover if hovered else base, rect, border_radius=10)
+        pygame.draw.rect(screen, (210, 255, 245), rect, 2, border_radius=10)
+        text_surf = body_font.render(label, True, (8, 20, 18) if primary else WHITE)
+        screen.blit(text_surf, text_surf.get_rect(center=rect.center))
     pygame.display.flip()
 
 
-def choose_save_file():
-    """If more than one save*.txt file sits next to the game, shows a simple picker so
-    the player can choose which one to play, and points the global SAVE_FILE at it for
-    the rest of the session -- e.g. so a developer's own save never gets loaded on a
-    fresh player's machine just because a stray save2.txt ended up next to save.txt, or
-    so multiple people can keep separate progress from one shared install. With zero or
-    one candidate (every brand new install, and every existing install before this
-    feature) this returns immediately without drawing anything -- completely unaffected.
-    Runs its own tiny event loop since it happens before init_game_state() has set up the
-    full menu/game state machine."""
-    global SAVE_FILE
-    candidates = _discover_save_files()
-    if len(candidates) <= 1:
+def show_migration_prompt():
+    """If _needs_legacy_migration() says a pre-save-slots save.txt is waiting, blocks on
+    a one-time Yes/No prompt before the real menu exists -- same "runs its own tiny event
+    loop since init_game_state() hasn't set up the full state machine yet" shape the old
+    multi-file picker (choose_save_file(), removed in favor of save slots) used. Answering
+    either way creates saves/ (see _needs_legacy_migration()'s docstring), so this can
+    never ask twice."""
+    if not _needs_legacy_migration():
         return
-
-    rows = _save_picker_layout(candidates)
-    picker_clock = pygame.time.Clock()
+    yes_rect, no_rect = _migration_prompt_layout()
+    title_font = pygame.font.SysFont(None, 40)
+    body_font = pygame.font.SysFont(None, 24)
+    prompt_clock = pygame.time.Clock()
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit(0)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                for path, _data, rect in rows:
-                    if rect.collidepoint(event.pos):
-                        SAVE_FILE = path
-                        return
-        _draw_save_picker(rows, pygame.mouse.get_pos())
-        picker_clock.tick(30)
+                if yes_rect.collidepoint(event.pos):
+                    _migrate_legacy_save_to_slot1()
+                    return
+                if no_rect.collidepoint(event.pos):
+                    os.makedirs(_saves_dir(), exist_ok=True)
+                    return
+        _draw_migration_prompt(yes_rect, no_rect, pygame.mouse.get_pos(), title_font, body_font)
+        prompt_clock.tick(30)
 
 
 def mark_dirty():
@@ -3664,6 +3954,17 @@ def init_pygame():
     clock = pygame.time.Clock()
 
 
+def _set_fullscreen(value):
+    """The one place that actually calls set_mode() to switch fullscreen on/off -- both
+    the F11 shortcut (handle_events()) and the Settings screen's Fullscreen toggle
+    (draw_paused_settings()) go through this instead of each re-deriving the same flags,
+    so the two can never drift out of sync with each other."""
+    global fullscreen, screen
+    fullscreen = value
+    flags = pygame.SCALED | (pygame.FULLSCREEN if fullscreen else 0)
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
+
+
 # ---------------- init: sound objects ----------------
 def init_sounds():
     global snd_jump, snd_land, snd_stomp, snd_death, snd_win, snd_double_jump
@@ -3690,7 +3991,19 @@ def init_sounds():
     bass_notes = (130.81, 130.81, 164.81, 146.83)
     music = concat_sounds([make_sound(0.3, const(f), "square", 0.12) for f in bass_notes])
     if SOUND_ENABLED:
-        music.play(loops=-1)
+        # Reserve channel 0 for music and play it there explicitly, instead of the plain
+        # music.play(loops=-1) this used to be -- every SFX above also calls .play() with
+        # no channel of its own, and pygame only ever has 8 channels by default, auto-
+        # picked. Sound.play()'s own docs say as much: "This will forcibly select a
+        # Channel, so playback may cut off a currently playing sound if necessary." Music
+        # has been running continuously since launch, so of everything sharing that pool
+        # it's the one auto-selection was most likely to treat as fair game to steal the
+        # moment a burst of jumps/coins/stomps filled the other channels -- which is
+        # exactly what "the music sometimes just stops" during busy gameplay was. A
+        # reserved channel is invisible to every other .play() call's auto-selection, so
+        # it can never be stolen.
+        pygame.mixer.set_reserved(1)
+        pygame.mixer.Channel(0).play(music, loops=-1)
 
 
 # ---------------- init: hero sprite sheet ----------------
@@ -3774,15 +4087,22 @@ def init_game_state():
     global PAUSE_RESUME_RECT, PAUSE_HELP_RECT, PAUSE_SETTINGS_RECT, PAUSE_MAIN_MENU_RECT, PAUSE_QUIT_RECT
     global PAUSE_SHAKE_TOGGLE_RECT, PAUSE_MUTE_TOGGLE_RECT
     global running, state, resume_state, transition_start, muted, show_fps, shop_page, shop_subpage
-    global particles, popups, _dirty, _last_autosave, menu_toast_text, menu_toast_until
+    global particles, popups, _dirty, _last_autosave, action_toast_text, action_toast_until
     global owned_trails, equipped_trail_key, trail_visible, _last_trail_particle_time, trail_page, recent_trails
     global paused_from, help_scroll, is_replay, replay_level, replay_page
-    global REPLAY_ENTRY_RECT, SETTINGS_ENTRY_RECT, QUIT_ENTRY_RECT, EXPORT_SAVE_RECT, IMPORT_SAVE_RECT
+    global REPLAY_ENTRY_RECT, SETTINGS_ENTRY_RECT, QUIT_ENTRY_RECT
+    global slot_name, playtime_seconds, _playtime_accum_ms
+    global SLOT_CONTINUE_RECT, SLOT_RENAME_RECT, SLOT_DUPLICATE_RECT, SLOT_EXPORT_RECT, SLOT_DELETE_RECT
+    global slot_action_target, rename_edit_text, CONFIRM_CANCEL_RECT, CONFIRM_ACCEPT_RECT
+    global ADV_IMPORT_RECT, ADV_SECONDARY_RECT, SETTINGS_ADVANCED_SAVE_RECT
 
     _save_data = load_save()
     level_num = _save_data["level"]
     score = _save_data["score"]
     wallet = _save_data["coins"]  # spendable currency (separate from the permanent Score)
+    slot_name = _save_data["slot_name"]
+    playtime_seconds = _save_data["playtime_seconds"]
+    _playtime_accum_ms = 0.0  # sub-second remainder between ticks -- see _update_playing_tick()
     upgrades = {key: _save_data[f"upg_{key}"] for key in UPGRADE_DEFAULTS}
     screen_shake_enabled = bool(_save_data["screen_shake"])
     music_volume = _save_data["music_volume"]
@@ -3852,11 +4172,6 @@ def init_game_state():
     # particular) that row is otherwise the only way in or out of the game, and Quit
     # doesn't belong crammed in alongside Shop/Trails/Help/Replay/Settings.
     QUIT_ENTRY_RECT = pygame.Rect(SCREEN_W - 98, 48, 84, 30)
-    # Mirrors QUIT_ENTRY_RECT on the opposite corner -- see export_save()/import_save()
-    # in handle_events() for what these actually do (a native file dialog, with a
-    # fallback if tkinter isn't available).
-    EXPORT_SAVE_RECT = pygame.Rect(14, 48, 100, 30)
-    IMPORT_SAVE_RECT = pygame.Rect(14, 82, 100, 30)
     SHOP_BACK_PROMPT = "PRESS ESC OR CLICK TO GO BACK"
     SHOP_BACK_RECT = small_font.render(SHOP_BACK_PROMPT, True, WHITE).get_rect(center=(SCREEN_W // 2, 415))
     TRAIL_UNEQUIP_RECT = pygame.Rect(SCREEN_W // 2 - 260, 103, 220, 32)
@@ -3877,6 +4192,37 @@ def init_game_state():
     PAUSE_QUIT_RECT = pygame.Rect(0, 0, 280, 44)
     PAUSE_QUIT_RECT.center = (SCREEN_W // 2, 377)
 
+    # Save Slot action sheet -- same vertical stack geometry as the pause menu just above,
+    # for the same "one screen, one clear column of actions" visual language.
+    SLOT_CONTINUE_RECT = pygame.Rect(0, 0, 280, 50)
+    SLOT_CONTINUE_RECT.center = (SCREEN_W // 2, 150)
+    SLOT_RENAME_RECT = pygame.Rect(0, 0, 280, 44)
+    SLOT_RENAME_RECT.center = (SCREEN_W // 2, 215)
+    SLOT_DUPLICATE_RECT = pygame.Rect(0, 0, 280, 44)
+    SLOT_DUPLICATE_RECT.center = (SCREEN_W // 2, 269)
+    SLOT_EXPORT_RECT = pygame.Rect(0, 0, 280, 44)
+    SLOT_EXPORT_RECT.center = (SCREEN_W // 2, 323)
+    SLOT_DELETE_RECT = pygame.Rect(0, 0, 280, 44)
+    SLOT_DELETE_RECT.center = (SCREEN_W // 2, 377)
+    slot_action_target = 1  # which slot "save_slot_actions"/rename/duplicate/delete apply to
+    rename_edit_text = ""   # live text for "save_slot_rename" -- see FpsCapControl for the pattern
+
+    # Shared Cancel/Confirm pair for every confirm dialog (Delete Save, and stage 6's
+    # Replace Slot N during Import) -- only one is ever shown at a time, so one rect pair
+    # covers all of them.
+    CONFIRM_CANCEL_RECT = pygame.Rect(0, 0, 180, 50)
+    CONFIRM_CANCEL_RECT.center = (SCREEN_W // 2 - 120, 280)
+    CONFIRM_ACCEPT_RECT = pygame.Rect(0, 0, 220, 50)
+    CONFIRM_ACCEPT_RECT.center = (SCREEN_W // 2 + 130, 280)
+
+    ADV_IMPORT_RECT = pygame.Rect(0, 0, 280, 50)
+    ADV_IMPORT_RECT.center = (SCREEN_W // 2, 180)
+    ADV_SECONDARY_RECT = pygame.Rect(0, 0, 280, 50)
+    ADV_SECONDARY_RECT.center = (SCREEN_W // 2, 250)
+    # Opens Advanced Save Management from the Settings screen.
+    SETTINGS_ADVANCED_SAVE_RECT = pygame.Rect(0, 0, 280, 34)
+    SETTINGS_ADVANCED_SAVE_RECT.center = (SCREEN_W // 2, 368)
+
     running = True
     state = "menu"  # see game_loop()/handle_events() for the full list of valid states
     resume_state = "playing"  # state to return to when leaving the menu (set fresh on first launch)
@@ -3892,14 +4238,14 @@ def init_game_state():
     popups = []
     _dirty = False
     _last_autosave = _now_ms()
-    menu_toast_text = ""
-    menu_toast_until = 0
+    action_toast_text = ""
+    action_toast_until = 0
 
 # ---------------- game loop ----------------
 def handle_events():
-    global running, fullscreen, screen, show_fps, state, resume_state, shop_page, shop_subpage
+    global show_fps, state, resume_state, shop_page, shop_subpage
     global trail_page, help_scroll, paused_from, replay_page, screen_shake_enabled, replay_search_text
-    global menu_toast_text, menu_toast_until
+    global action_toast_text, action_toast_until, slot_action_target, rename_edit_text, _pending_import
 
     for event in pygame.event.get():
         # Every menu/button/slider/toggle in the game is written in terms of
@@ -3926,8 +4272,19 @@ def handle_events():
             quit_game()
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                if state in ("shop", "trail_menu", "replay_picker"):
+                if state in ("shop", "trail_menu", "replay_picker", "save_slots"):
                     state = "menu"
+                elif state == "save_slot_actions":
+                    state = "save_slots"
+                elif state in ("save_slot_rename", "save_slot_duplicate_pick", "save_slot_delete_confirm"):
+                    state = "save_slot_actions"  # Esc always cancels back to the action sheet, no side effects
+                elif state == "advanced_save_settings":
+                    state = "paused_settings"
+                elif state == "import_preview":
+                    _pending_import = None
+                    state = "advanced_save_settings"
+                elif state == "import_replace_confirm":
+                    state = "import_preview"
                 elif state == "help":
                     state = paused_from
                 elif state == "paused_settings":
@@ -3944,14 +4301,13 @@ def handle_events():
                     set_muted(False)
                     state = "menu"
             if event.key == pygame.K_F11:
-                fullscreen = not fullscreen
-                flags = pygame.SCALED | (pygame.FULLSCREEN if fullscreen else 0)
-                screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
+                _set_fullscreen(not fullscreen)
+                toggle_fullscreen.value = fullscreen  # keep the Settings widget in sync
             if event.key == pygame.K_F3:
                 show_fps = not show_fps
             if state == "menu":
                 if event.key in (pygame.K_SPACE, pygame.K_RETURN):
-                    start_game()
+                    state = "save_slots"
                 if event.key == pygame.K_s:
                     state = "shop"
                 if event.key == pygame.K_t:
@@ -3979,6 +4335,14 @@ def handle_events():
                     replay_search_text = ""
                 elif event.unicode.isdigit() and len(replay_search_text) < 5:
                     replay_search_text += event.unicode
+            elif state == "save_slot_rename":
+                if event.key == pygame.K_RETURN:
+                    rename_slot(slot_action_target, rename_edit_text)
+                    state = "save_slot_actions"
+                elif event.key == pygame.K_BACKSPACE:
+                    rename_edit_text = rename_edit_text[:-1]
+                elif event.unicode.isprintable() and event.unicode and len(rename_edit_text) < SLOT_NAME_MAX_LEN:
+                    rename_edit_text += event.unicode
             elif state == "shop":
                 if event.key in (pygame.K_LEFT, pygame.K_a):
                     shop_page = (shop_page - 1) % len(SHOP_CATEGORIES)
@@ -4029,7 +4393,7 @@ def handle_events():
                 snd_coin.play()  # quick preview so you can hear the level you just set
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if PLAY_RECT.collidepoint(event.pos):
-                    start_game()
+                    state = "save_slots"
                 elif SHOP_ENTRY_RECT.collidepoint(event.pos):
                     state = "shop"
                 elif TRAIL_ENTRY_RECT.collidepoint(event.pos):
@@ -4045,12 +4409,107 @@ def handle_events():
                     state = "paused_settings"
                 elif QUIT_ENTRY_RECT.collidepoint(event.pos):
                     quit_game()
-                elif EXPORT_SAVE_RECT.collidepoint(event.pos):
-                    menu_toast_text = export_save()
-                    menu_toast_until = _now_ms() + 4000
-                elif IMPORT_SAVE_RECT.collidepoint(event.pos):
-                    menu_toast_text = import_save()
-                    menu_toast_until = _now_ms() + 4000
+        elif state == "save_slots":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if SHOP_BACK_RECT.collidepoint(event.pos):
+                    state = "menu"
+                else:
+                    for slot in list_save_slots():
+                        rect = SHOP_ROW_SLOTS[slot["index"] - 1]
+                        if rect.collidepoint(event.pos):
+                            if slot["data"] is None:
+                                activate_slot(slot["index"])
+                                state = "playing"
+                            else:
+                                slot_action_target = slot["index"]
+                                state = "save_slot_actions"
+                            break
+        elif state == "save_slot_actions":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if SHOP_BACK_RECT.collidepoint(event.pos):
+                    state = "save_slots"
+                elif SLOT_CONTINUE_RECT.collidepoint(event.pos):
+                    activate_slot(slot_action_target)
+                    state = "playing"
+                elif SLOT_RENAME_RECT.collidepoint(event.pos):
+                    data = _peek_slot(slot_action_target)
+                    rename_edit_text = data["slot_name"] if data else ""
+                    state = "save_slot_rename"
+                elif SLOT_DUPLICATE_RECT.collidepoint(event.pos):
+                    state = "save_slot_duplicate_pick"
+                elif SLOT_EXPORT_RECT.collidepoint(event.pos):
+                    action_toast_text = export_slot(slot_action_target)
+                    action_toast_until = _now_ms() + 4000
+                    state = "save_slots"
+                elif SLOT_DELETE_RECT.collidepoint(event.pos):
+                    state = "save_slot_delete_confirm"
+        elif state == "save_slot_duplicate_pick":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if SHOP_BACK_RECT.collidepoint(event.pos):
+                    state = "save_slot_actions"
+                else:
+                    # Rows are compacted from the top (see draw_save_slot_duplicate_pick()),
+                    # not one row per absolute slot number, so hit-testing has to walk the
+                    # same enumerate(empty_slots) the draw does rather than SHOP_ROW_SLOTS[slot["index"] - 1].
+                    empty_slots = [slot for slot in list_save_slots() if slot["data"] is None]
+                    for i, slot in enumerate(empty_slots):
+                        if SHOP_ROW_SLOTS[i].collidepoint(event.pos):
+                            duplicate_slot(slot_action_target, slot["index"])
+                            action_toast_text = f"Duplicated into Slot {slot['index']}"
+                            action_toast_until = _now_ms() + 3000
+                            state = "save_slots"
+                            break
+        elif state == "save_slot_delete_confirm":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if CONFIRM_CANCEL_RECT.collidepoint(event.pos):
+                    state = "save_slot_actions"
+                elif CONFIRM_ACCEPT_RECT.collidepoint(event.pos):
+                    deleted_index = slot_action_target
+                    delete_slot(deleted_index)
+                    action_toast_text = f"Slot {deleted_index} deleted"
+                    action_toast_until = _now_ms() + 3000
+                    state = "save_slots"
+        elif state == "advanced_save_settings":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if SHOP_BACK_RECT.collidepoint(event.pos):
+                    state = "paused_settings"
+                elif ADV_IMPORT_RECT.collidepoint(event.pos):
+                    err = begin_import()
+                    if err:
+                        action_toast_text = err
+                        action_toast_until = _now_ms() + 4000
+                    else:
+                        state = "import_preview"
+                elif ADV_SECONDARY_RECT.collidepoint(event.pos):
+                    action = export_slot(active_slot) if _advanced_save_mgmt_is_limited() else open_save_folder()
+                    action_toast_text = action
+                    action_toast_until = _now_ms() + 4000
+        elif state == "import_preview":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if SHOP_BACK_RECT.collidepoint(event.pos):
+                    _pending_import = None
+                    state = "advanced_save_settings"
+                else:
+                    for slot in list_save_slots():
+                        if SHOP_ROW_SLOTS[slot["index"] - 1].collidepoint(event.pos):
+                            if slot["data"] is None:
+                                action_toast_text = commit_pending_import(slot["index"])
+                                action_toast_until = _now_ms() + 4000
+                                state = "advanced_save_settings"
+                            else:
+                                # Reuses slot_action_target -- same "which slot" meaning
+                                # as the Save Slot action sheet, just for this flow instead.
+                                slot_action_target = slot["index"]
+                                state = "import_replace_confirm"
+                            break
+        elif state == "import_replace_confirm":
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if CONFIRM_CANCEL_RECT.collidepoint(event.pos):
+                    state = "import_preview"
+                elif CONFIRM_ACCEPT_RECT.collidepoint(event.pos):
+                    action_toast_text = commit_pending_import(slot_action_target)
+                    action_toast_until = _now_ms() + 4000
+                    state = "advanced_save_settings"
         elif state == "shop":
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 category = SHOP_CATEGORIES[shop_page]
@@ -4160,6 +4619,245 @@ def handle_events():
                     sync_settings_from_widgets()
                     save_game()
                     state = paused_from  # "menu" or "paused", whichever opened Settings
+                elif SETTINGS_ADVANCED_SAVE_RECT.collidepoint(event.pos):
+                    state = "advanced_save_settings"
+
+
+def _format_playtime(seconds):
+    hours, minutes = seconds // 3600, (seconds % 3600) // 60
+    return f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+
+def _format_last_played(timestamp):
+    return "Never played" if timestamp <= 0 else time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
+def _draw_slot_row(rect, slot, mouse_pos):
+    """One row of a slot list -- shared by draw_save_slots(), draw_save_slot_duplicate_pick()
+    (empty slots only), and draw_import_preview() (every slot, as an import destination)."""
+    hovered = rect.collidepoint(mouse_pos)
+    data = slot["data"]
+    pygame.draw.rect(screen, (55, 80, 75) if hovered else (40, 60, 55), rect, border_radius=8)
+    pygame.draw.rect(screen, (0, 255, 200) if data else (80, 80, 95), rect, 2, border_radius=8)
+    if data is None:
+        label_surf = small_font.render(f"Slot {slot['index']}", True, WHITE)
+        screen.blit(label_surf, (rect.x + 12, rect.y + 3))
+        new_surf = small_font.render("New Game", True, (150, 220, 190))
+        screen.blit(new_surf, (rect.x + 12, rect.y + 19))
+    else:
+        name = data["slot_name"] or f"Slot {slot['index']}"
+        name_surf = render_text_fit(small_font, name, WHITE, rect.w - 24)
+        screen.blit(name_surf, (rect.x + 12, rect.y + 3))
+        info = (f"Level {data['level']}   {data['coins']:,} coins   Score {data['score']:,}   "
+                f"{_format_playtime(data['playtime_seconds'])}   {_format_last_played(data['last_played'])}")
+        info_surf = render_text_fit(small_font, info, (170, 200, 198), rect.w - 24)
+        screen.blit(info_surf, (rect.x + 12, rect.y + 19))
+
+
+def _draw_hint_or_toast(y, fallback_text, fallback_color=(170, 170, 190)):
+    """Shows the live action_toast (a Rename/Duplicate/Delete/Export/Import result) if
+    still within its time window, else the screen's normal hint line -- shared by
+    draw_save_slots() and draw_advanced_save_settings() so a result from either flow is
+    actually visible wherever the player lands afterward (both flows commonly end up
+    back on a DIFFERENT screen than the one that triggered them), not just when landing
+    back on the exact screen that triggered it."""
+    if _now_ms() < action_toast_until:
+        surf = render_text_fit(small_font, action_toast_text, (255, 230, 120), SCREEN_W - 40)
+    else:
+        surf = small_font.render(fallback_text, True, fallback_color)
+    screen.blit(surf, surf.get_rect(center=(SCREEN_W // 2, y)))
+
+
+def draw_save_slots():
+    """The primary way players manage progress now (PLAY leads here -- see
+    handle_events()): NUM_SAVE_SLOTS rows, reusing the Shop's row-list geometry
+    (SHOP_ROW_SLOTS). An empty slot reads "New Game" and starts one immediately on click;
+    an occupied slot opens the action sheet ("save_slot_actions") instead of jumping
+    straight into gameplay."""
+    screen.blit(MENU_BG, (0, 0))
+    draw_glow_text(screen, "SAVE SLOTS", title_font, (SCREEN_W // 2, 40), (0, 255, 220))
+    _draw_hint_or_toast(78, "Click an empty slot to start a new game, or a save to continue it")
+
+    mouse_pos = pygame.mouse.get_pos()
+    for slot in list_save_slots():
+        _draw_slot_row(SHOP_ROW_SLOTS[slot["index"] - 1], slot, mouse_pos)
+
+    back_surf = small_font.render(SHOP_BACK_PROMPT, True, (200, 200, 220))
+    screen.blit(back_surf, SHOP_BACK_RECT)
+    draw_fps_overlay()
+    pygame.display.flip()
+
+
+def draw_save_slot_actions():
+    """Continue/Rename/Duplicate/Export/Delete for slot_action_target (set when a save
+    row is clicked on "save_slots" -- see handle_events())."""
+    screen.blit(MENU_BG, (0, 0))
+    data = _peek_slot(slot_action_target)
+    name = (data["slot_name"] if data else "") or f"Slot {slot_action_target}"
+    draw_glow_text(screen, name.upper(), title_font, (SCREEN_W // 2, 50), (0, 255, 220))
+    if data:
+        info = (f"Level {data['level']}   {data['coins']:,} coins   Score {data['score']:,}   "
+                f"{_format_playtime(data['playtime_seconds'])}   played {_format_last_played(data['last_played'])}")
+        info_surf = render_text_fit(small_font, info, (170, 200, 198), SCREEN_W - 100)
+        screen.blit(info_surf, info_surf.get_rect(center=(SCREEN_W // 2, 95)))
+
+    mouse_pos = pygame.mouse.get_pos()
+    draw_menu_button(SLOT_CONTINUE_RECT, "CONTINUE", SLOT_CONTINUE_RECT.collidepoint(mouse_pos),
+                      primary=True, font_obj=font)
+    draw_menu_button(SLOT_RENAME_RECT, "Rename", SLOT_RENAME_RECT.collidepoint(mouse_pos))
+    draw_menu_button(SLOT_DUPLICATE_RECT, "Duplicate", SLOT_DUPLICATE_RECT.collidepoint(mouse_pos))
+    draw_menu_button(SLOT_EXPORT_RECT, "Export", SLOT_EXPORT_RECT.collidepoint(mouse_pos))
+    draw_menu_button(SLOT_DELETE_RECT, "Delete", SLOT_DELETE_RECT.collidepoint(mouse_pos))
+
+    back_surf = small_font.render("PRESS ESC OR CLICK TO GO BACK", True, (200, 200, 220))
+    screen.blit(back_surf, SHOP_BACK_RECT)
+    draw_fps_overlay()
+    pygame.display.flip()
+
+
+def draw_save_slot_rename():
+    """Free-text rename box for slot_action_target -- same click-to-edit/Return-to-
+    confirm/Esc-to-cancel shape as FpsCapControl's type-to-enter mode, just accepting any
+    printable character instead of digits-only."""
+    screen.blit(MENU_BG, (0, 0))
+    draw_glow_text(screen, "RENAME SAVE", title_font, (SCREEN_W // 2, 90), (0, 255, 220))
+
+    box_rect = pygame.Rect(0, 0, 520, 50)
+    box_rect.center = (SCREEN_W // 2, 200)
+    pygame.draw.rect(screen, (30, 30, 42), box_rect, border_radius=8)
+    pygame.draw.rect(screen, (255, 230, 90), box_rect, 2, border_radius=8)
+    shown = render_text_fit(font, rename_edit_text + "_", WHITE, box_rect.w - 28)
+    screen.blit(shown, shown.get_rect(midleft=(box_rect.x + 14, box_rect.centery)))
+
+    hint = small_font.render("Enter to save, Esc to cancel", True, (170, 170, 190))
+    screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, 260)))
+    draw_fps_overlay()
+    pygame.display.flip()
+
+
+def draw_save_slot_duplicate_pick():
+    """Lists only the EMPTY slots as duplicate_slot() destinations -- never lets the
+    player overwrite an existing save by duplicating into it. If there are none, explains
+    why instead of showing an empty picker (per the spec)."""
+    screen.blit(MENU_BG, (0, 0))
+    draw_glow_text(screen, "DUPLICATE INTO...", title_font, (SCREEN_W // 2, 40), (0, 255, 220))
+
+    empty_slots = [slot for slot in list_save_slots() if slot["data"] is None]
+    if not empty_slots:
+        msg = small_font.render(
+            "All save slots are full -- delete or free up a slot first to duplicate into.",
+            True, (220, 200, 200),
+        )
+        screen.blit(msg, msg.get_rect(center=(SCREEN_W // 2, 200)))
+    else:
+        hint = small_font.render("Click an empty slot to copy this save into it", True, (170, 170, 190))
+        screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, 78)))
+        mouse_pos = pygame.mouse.get_pos()
+        # Compacted from the top (row 0, 1, 2, ...) instead of one row per absolute slot
+        # number -- with early slots occupied (the common case once you're using this at
+        # all), positioning by slot["index"] left a dead gap where those occupied rows
+        # would have been instead of a clean, top-aligned list like every other slot
+        # picker in the game. handle_events()'s "save_slot_duplicate_pick" hit-testing
+        # mirrors this same enumerate(empty_slots) order.
+        for i, slot in enumerate(empty_slots):
+            _draw_slot_row(SHOP_ROW_SLOTS[i], slot, mouse_pos)
+
+    back_surf = small_font.render("PRESS ESC OR CLICK TO GO BACK", True, (200, 200, 220))
+    screen.blit(back_surf, SHOP_BACK_RECT)
+    draw_fps_overlay()
+    pygame.display.flip()
+
+
+def _draw_danger_button(rect, label, hovered):
+    """Same visual structure as draw_menu_button()'s primary style, just red -- used for
+    the one-way-door half of a confirm dialog (Delete, stage 6's Replace) so it never
+    looks like just another ordinary button."""
+    base, hover = (140, 30, 30), (200, 50, 50)
+    pygame.draw.rect(screen, hover if hovered else base, rect, border_radius=10)
+    pygame.draw.rect(screen, (255, 200, 200), rect, 2, border_radius=10)
+    text_surf = font.render(label, True, WHITE)
+    screen.blit(text_surf, text_surf.get_rect(center=rect.center))
+
+
+def draw_confirm_dialog(title, message, confirm_label):
+    """Generic Cancel/Confirm modal -- shared by Delete Save here and, in stage 6, Import's
+    Replace Slot N. Never acted on immediately by anything that calls this: the caller's
+    state only advances once the player actually clicks CONFIRM_ACCEPT_RECT."""
+    screen.blit(MENU_BG, (0, 0))
+    draw_glow_text(screen, title, title_font, (SCREEN_W // 2, 130), (255, 90, 90))
+    msg_surf = render_text_fit(small_font, message, (220, 220, 230), SCREEN_W - 80)
+    screen.blit(msg_surf, msg_surf.get_rect(center=(SCREEN_W // 2, 190)))
+
+    mouse_pos = pygame.mouse.get_pos()
+    draw_menu_button(CONFIRM_CANCEL_RECT, "Cancel", CONFIRM_CANCEL_RECT.collidepoint(mouse_pos))
+    _draw_danger_button(CONFIRM_ACCEPT_RECT, confirm_label, CONFIRM_ACCEPT_RECT.collidepoint(mouse_pos))
+    draw_fps_overlay()
+    pygame.display.flip()
+
+
+def draw_save_slot_delete_confirm():
+    draw_confirm_dialog(
+        "DELETE SAVE?",
+        f"Slot {slot_action_target} will be permanently deleted. This action cannot be undone.",
+        "Delete",
+    )
+
+
+def draw_import_preview():
+    """Step 7 of the Import wizard: shows what was found in the picked file, then every
+    slot as a destination -- an empty one commits immediately (nothing to lose), an
+    occupied one goes to "import_replace_confirm" first (see handle_events())."""
+    screen.blit(MENU_BG, (0, 0))
+    draw_glow_text(screen, "IMPORT SAVE", title_font, (SCREEN_W // 2, 32), (0, 255, 220))
+    data = _pending_import["data"] if _pending_import else None
+    if data is None:
+        msg = small_font.render("Nothing to import.", True, (220, 200, 200))
+        screen.blit(msg, msg.get_rect(center=(SCREEN_W // 2, 62)))
+    else:
+        preview = (f"Level {data['level']}   {data['coins']:,} coins   Score {data['score']:,}   "
+                   f"{_format_playtime(data['playtime_seconds'])}   version {data['save_version']}")
+        preview_surf = render_text_fit(small_font, preview, (170, 200, 198), SCREEN_W - 80)
+        screen.blit(preview_surf, preview_surf.get_rect(center=(SCREEN_W // 2, 60)))
+    hint = small_font.render("Where would you like to import this save?", True, (200, 200, 220))
+    screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, 88)))
+
+    mouse_pos = pygame.mouse.get_pos()
+    for slot in list_save_slots():
+        _draw_slot_row(SHOP_ROW_SLOTS[slot["index"] - 1], slot, mouse_pos)
+
+    back_surf = small_font.render("PRESS ESC OR CLICK TO CANCEL IMPORT", True, (200, 200, 220))
+    screen.blit(back_surf, back_surf.get_rect(center=SHOP_BACK_RECT.center))
+    draw_fps_overlay()
+    pygame.display.flip()
+
+
+def draw_import_replace_confirm():
+    draw_confirm_dialog(
+        "REPLACE SAVE SLOT?",
+        f"Your current progress in Slot {slot_action_target} will be permanently lost.",
+        "Replace",
+    )
+
+
+def draw_advanced_save_settings():
+    """Manual Import/Export for players who want file-level control -- Save Slots (see
+    draw_save_slots()) is the primary way to manage progress; this is the "advanced"
+    escape hatch the spec asks for, reached from the Settings screen."""
+    screen.blit(MENU_BG, (0, 0))
+    draw_glow_text(screen, "ADVANCED SAVE MANAGEMENT", font, (SCREEN_W // 2, 50), (0, 255, 220))
+    _draw_hint_or_toast(108, "Most players should use SAVE SLOTS from the main menu instead.")
+
+    mouse_pos = pygame.mouse.get_pos()
+    draw_menu_button(ADV_IMPORT_RECT, "Import Save", ADV_IMPORT_RECT.collidepoint(mouse_pos),
+                      primary=True, font_obj=font)
+    secondary_label = "Export Save" if _advanced_save_mgmt_is_limited() else "Open Save Folder"
+    draw_menu_button(ADV_SECONDARY_RECT, secondary_label, ADV_SECONDARY_RECT.collidepoint(mouse_pos),
+                      font_obj=font)
+
+    back_surf = small_font.render("PRESS ESC OR CLICK TO GO BACK", True, (200, 200, 220))
+    screen.blit(back_surf, SHOP_BACK_RECT)
+    draw_fps_overlay()
+    pygame.display.flip()
 
 
 def draw_menu():
@@ -4181,23 +4879,12 @@ def draw_menu():
     draw_menu_button(REPLAY_ENTRY_RECT, "REPLAY", REPLAY_ENTRY_RECT.collidepoint(mouse_pos), sub_label="R")
     draw_menu_button(SETTINGS_ENTRY_RECT, "SETTINGS", SETTINGS_ENTRY_RECT.collidepoint(mouse_pos), sub_label="O")
     draw_menu_button(QUIT_ENTRY_RECT, "QUIT", QUIT_ENTRY_RECT.collidepoint(mouse_pos))
-    draw_menu_button(EXPORT_SAVE_RECT, "EXPORT", EXPORT_SAVE_RECT.collidepoint(mouse_pos))
-    draw_menu_button(IMPORT_SAVE_RECT, "IMPORT", IMPORT_SAVE_RECT.collidepoint(mouse_pos))
 
-    # A live Export/Import confirmation or error briefly takes over this line instead of
-    # adding new geometry that would have to squeeze into an already-tight 440px-tall
-    # screen -- see export_save()/import_save()'s call sites in handle_events().
-    # render_text_fit() rather than a plain render(): a chosen export/import path can
-    # easily be wider than the screen (render_text_fit shrinks it to fit instead of
-    # letting it run off both edges).
-    if _now_ms() < menu_toast_until:
-        stats_surf = render_text_fit(small_font, menu_toast_text, (255, 230, 120), SCREEN_W - 40)
-    else:
-        stats_surf = small_font.render(
-            f"Lifetime: {stat_coins:,} coins earned | {stat_stomps:,} stomps | {stat_deaths:,} deaths",
-            True,
-            (140, 140, 160),
-        )
+    stats_surf = small_font.render(
+        f"Lifetime: {stat_coins:,} coins earned | {stat_stomps:,} stomps | {stat_deaths:,} deaths",
+        True,
+        (140, 140, 160),
+    )
     screen.blit(stats_surf, stats_surf.get_rect(center=(SCREEN_W // 2, 386)))
 
     hint = small_font.render(f"Coins: {wallet}   F11: Fullscreen   F3: FPS   Esc: Quit", True, (150, 150, 170))
@@ -4525,17 +5212,30 @@ HELP_CONTENT = [
         "finish a level, make a purchase, pause, or quit. Nothing is lost by closing",
         "the game normally.",
         "",
-        f"The save file lives at: {os.path.dirname(SAVE_FILE) or '.'}",
+        "SAVE SLOTS (PLAY, from the main menu) is how you manage progress -- up to",
+        f"{NUM_SAVE_SLOTS} independent games, each with its own level, coins, upgrades,",
+        "cosmetics, and stats. Click an empty slot to start a new game in it immediately;",
+        "click a save to open CONTINUE, Rename, Duplicate, Export, or Delete. Delete",
+        "always asks for confirmation first -- it can't be undone. Duplicate copies a",
+        "save into an empty slot you choose, so you can branch off before trying",
+        "something risky (if every slot is full, it explains why instead of letting you",
+        "pick nowhere). Export opens a native Save-As dialog so you can save a copy",
+        "anywhere you like -- a USB drive, cloud folder, another device, wherever.",
         "",
-        "EXPORT (top-left of the main menu) opens a native Save-As dialog so you can",
-        "save a copy anywhere you like -- a USB drive, cloud folder, another device,",
-        "wherever. IMPORT opens the matching Open dialog to load any save file back in,",
-        "replacing your current progress. Neither is available on Android (there's no",
-        "such dialog there) -- EXPORT instead drops a timestamped copy in a \"backups\"",
-        "folder next to the save file, and IMPORTing means placing a file in the folder",
-        "above (as save.txt) yourself before launching. If more than one save.txt/",
-        "save<N>.txt sits directly in that folder (not in \"backups\"), a picker appears",
-        "at startup letting you choose which one to play.",
+        "ADVANCED SAVE MANAGEMENT (in Settings) is for manual file control instead of",
+        "slots: Import Save opens a native Open dialog, previews the file (level, coins,",
+        "playtime, version), then asks which slot to import into -- an empty slot",
+        "commits immediately, an occupied one asks \"Replace Save Slot?\" first. On",
+        "desktop, Open Save Folder reveals the save files directly in your file manager.",
+        "Android has no such dialogs: Export Save there drops a timestamped copy in a",
+        "\"backups\" folder instead, and importing means placing a file in the saves",
+        "folder yourself (as slot<N>.save) before launching.",
+        "",
+        f"The saves folder lives at: {os.path.dirname(SAVE_FILE) or '.'}",
+        "",
+        "Upgrading from an older version? Your existing save is offered for import into",
+        "Slot 1 automatically, once, the first time you launch -- the original file is",
+        "kept either way, never deleted.",
     ]),
     ("Pause Menu", [
         "Esc during a run opens the Pause menu, which fully freezes gameplay. From",
@@ -4695,7 +5395,7 @@ def draw_paused():
 
 
 def draw_paused_settings():
-    global fps_cap, fullscreen, screen, show_fps
+    global fps_cap, show_fps
     # Applied straight from the live widget every frame (same pattern draw_menu() uses
     # for music/SFX volume) so dragging/typing a new FPS Cap takes effect on the very
     # next rendered frame -- no separate "Apply" step, no restart needed.
@@ -4703,12 +5403,18 @@ def draw_paused_settings():
     show_fps = toggle_show_fps.value
     if toggle_mute.value != muted:
         set_muted(toggle_mute.value)
-    if toggle_fullscreen.value != fullscreen:
-        # Same mode switch F11 does (see handle_events()) -- just reachable by touch/
-        # mouse now instead of only a keyboard shortcut.
-        fullscreen = toggle_fullscreen.value
-        flags = pygame.SCALED | (pygame.FULLSCREEN if fullscreen else 0)
-        screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
+    if toggle_fullscreen.value != fullscreen and not touch_controls.active_fingers:
+        # Same mode switch F11 goes through (see _set_fullscreen()) -- just reachable by
+        # touch/mouse here instead of only a keyboard shortcut. The active_fingers check
+        # is why: pygame.display.set_mode() tears down and recreates the real OS window,
+        # and doing that while the finger that just tapped this toggle is still touching
+        # the screen can leave the touchscreen driver's input grab pointed at the window
+        # that no longer exists -- every touch after that silently stops registering until
+        # the app is restarted, even though the tap that caused it looked like it worked.
+        # F11 never hits this since a key press has no "still touching" state to land
+        # mid-gesture in. Waiting the one frame (typically far less) for the finger to
+        # lift avoids the whole class of problem instead of chasing its symptom.
+        _set_fullscreen(toggle_fullscreen.value)
 
     screen.blit(MENU_BG, (0, 0))
     draw_glow_text(screen, "SETTINGS", title_font, (SCREEN_W // 2, 60), (0, 255, 220))
@@ -4727,6 +5433,10 @@ def draw_paused_settings():
         slider_touch_opacity.draw(screen, small_font)
         slider_touch_size.draw(screen, small_font)
         toggle_touch_swap.draw(screen, small_font)
+
+    mouse_pos = pygame.mouse.get_pos()
+    draw_menu_button(SETTINGS_ADVANCED_SAVE_RECT, "ADVANCED SAVE MANAGEMENT",
+                      SETTINGS_ADVANCED_SAVE_RECT.collidepoint(mouse_pos))
 
     back_surf = small_font.render("PRESS ESC OR CLICK TO GO BACK", True, (200, 200, 220))
     screen.blit(back_surf, SHOP_BACK_RECT)
@@ -4784,8 +5494,17 @@ def _update_playing_tick():
     fixed-timestep comment near SIM_HZ) and exactly once by update_and_draw_playing() for
     direct/standalone callers (every existing test)."""
     global state, transition_start, particles, popups
+    global playtime_seconds, _playtime_accum_ms
 
     if state == "playing":
+        # Save-slot metadata only (see SAVE_DEFAULTS) -- accrued in whole seconds so it
+        # writes as a plain int like every other field; the sub-second remainder carries
+        # over between ticks instead of being truncated away every single tick.
+        _playtime_accum_ms += SIM_DT_MS
+        if _playtime_accum_ms >= 1000.0:
+            whole_seconds = int(_playtime_accum_ms // 1000.0)
+            playtime_seconds += whole_seconds
+            _playtime_accum_ms -= whole_seconds * 1000.0
         player.update(platforms, spikes, enemies, coins, one_way_platforms, checkpoints, wind_zones)
         enemies.update(platforms, player.rect)
         coins.update()
@@ -5015,6 +5734,30 @@ def game_loop(max_frames=None):
         if state == "menu":
             draw_menu()
             continue
+        if state == "save_slots":
+            draw_save_slots()
+            continue
+        if state == "save_slot_actions":
+            draw_save_slot_actions()
+            continue
+        if state == "save_slot_rename":
+            draw_save_slot_rename()
+            continue
+        if state == "save_slot_duplicate_pick":
+            draw_save_slot_duplicate_pick()
+            continue
+        if state == "save_slot_delete_confirm":
+            draw_save_slot_delete_confirm()
+            continue
+        if state == "advanced_save_settings":
+            draw_advanced_save_settings()
+            continue
+        if state == "import_preview":
+            draw_import_preview()
+            continue
+        if state == "import_replace_confirm":
+            draw_import_replace_confirm()
+            continue
         if state == "shop":
             draw_shop()
             continue
@@ -5064,9 +5807,9 @@ def main(argv=None):
     init_sprites()
     if not args.smoke_test:
         # Skipped in --smoke-test mode -- it must stay deterministic/non-interactive for
-        # CI regardless of how many save*.txt files happen to sit next to main.py (e.g.
-        # a developer's own working copy while testing this very feature).
-        choose_save_file()
+        # CI regardless of whether a pre-save-slots save.txt happens to sit next to
+        # main.py (e.g. a developer's own working copy while testing this very feature).
+        show_migration_prompt()
     init_game_state()
 
     try:
