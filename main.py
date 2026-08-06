@@ -19,7 +19,9 @@ import colorsys
 import math
 import os
 import random
+import shutil
 import sys
+import time
 from pathlib import Path
 
 import pygame
@@ -2055,11 +2057,17 @@ class Player(pygame.sprite.Sprite):
         effective_buffer = JUMP_BUFFER + JUMP_BUFFER_BONUS_PER_LEVEL * upgrades["jump_buffer"]
 
         keys = pygame.key.get_pressed()
+        # pygame.key.get_pressed() only reflects real keyboard state -- it has no idea
+        # about the touch overlay's held buttons, so those are checked separately
+        # everywhere a *continuous* key hold matters (move/jump-hold/glide below). Edge-
+        # triggered actions (Jump's buffer, Dash) don't need this: their touch buttons
+        # call player.try_jump()/try_dash() directly -- see TouchControls.
+        touch_keys = touch_controls.held_keys()
         self.vel.x = 0
-        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+        if keys[pygame.K_LEFT] or keys[pygame.K_a] or pygame.K_LEFT in touch_keys:
             self.vel.x = -move_speed
             self.facing = -1
-        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d] or pygame.K_RIGHT in touch_keys:
             self.vel.x = move_speed
             self.facing = 1
 
@@ -2115,13 +2123,14 @@ class Player(pygame.sprite.Sprite):
             snd_double_jump.play()
             spawn_particles(self.rect.centerx, self.rect.bottom, WHITE, count=6, speed=2)
 
-        if not (keys[pygame.K_SPACE] or keys[pygame.K_UP] or keys[pygame.K_w]) and self.vel.y < -6:
+        if (not (keys[pygame.K_SPACE] or keys[pygame.K_UP] or keys[pygame.K_w] or pygame.K_SPACE in touch_keys)
+                and self.vel.y < -6):
             self.vel.y = -6
 
         self.vel.y = min(self.vel.y + GRAVITY, MAX_FALL_SPEED)
 
         if (upgrades["glide"] > 0 and not self.on_ground and self.vel.y > 0
-                and keys[pygame.K_DOWN] and self.glide_frames_left > 0):
+                and (keys[pygame.K_DOWN] or pygame.K_DOWN in touch_keys) and self.glide_frames_left > 0):
             self.vel.y = min(self.vel.y, GLIDE_FALL_SPEED)
             self.glide_frames_left -= 1
 
@@ -2427,6 +2436,267 @@ class FpsCapControl:
         surf.blit(val_surf, val_surf.get_rect(center=self.value_rect.center))
 
 
+# ---------------- touch controls ----------------
+# Virtual on-screen controls for touchscreens: Android (via python-for-android/buildozer)
+# and "hybrid" devices that have both a touchscreen and a keyboard/mouse (a Windows
+# tablet, a Steam Deck in touchscreen mode, a touchscreen laptop). Movement is binary --
+# Player.update() only ever sets vel.x to -move_speed/+move_speed/0, never anything
+# analog -- so plain press-buttons are the right fit here, not a virtual joystick.
+#
+# Desktop players who never touch the screen never see any of this: the overlay only
+# becomes visible once a real pygame.FINGERDOWN/UP/MOTION event has actually been seen
+# (or immediately, on Android, which has no keyboard to fall back to), and it fades back
+# out after a few seconds of touch inactivity so it doesn't clutter a keyboard/mouse
+# session on a hybrid device. Button hit-testing stays live even while fully faded out,
+# so the very first tap after hiding both registers as input AND fades the overlay back
+# in -- see TouchControls.on_finger_down().
+def _is_android():
+    """True only under python-for-android/buildozer -- the only realistic way this pygame
+    game reaches an Android device. Checked once (TouchControls.__init__); a process
+    never stops being Android mid-session."""
+    return (
+        sys.platform == "android"
+        or hasattr(sys, "getandroidapilevel")
+        or "ANDROID_ARGUMENT" in os.environ
+        or "ANDROID_PRIVATE" in os.environ
+    )
+
+
+def _finger_event_logical_pos(event):
+    """FINGERDOWN/UP/MOTION report x/y as 0..1 fractions of the real OS window, unlike
+    mouse events (which pygame.SCALED already remaps for us) -- this replicates SCALED's
+    own letterbox math (uniform scale-to-fit, centered) to recover logical 800x440
+    coordinates from them."""
+    win_w, win_h = pygame.display.get_window_size()
+    scale = min(win_w / SCREEN_W, win_h / SCREEN_H) or 1.0
+    draw_w, draw_h = SCREEN_W * scale, SCREEN_H * scale
+    off_x, off_y = (win_w - draw_w) / 2, (win_h - draw_h) / 2
+    return ((event.x * win_w - off_x) / scale, (event.y * win_h - off_y) / scale)
+
+
+def _finger_event_logical_delta(event):
+    """FINGERMOTION's dx/dy are normalized deltas (fractions of the real window size),
+    using the same normalization as x/y above -- only the uniform scale factor applies to
+    a delta, not the letterbox offset (which cancels out between two points)."""
+    win_w, win_h = pygame.display.get_window_size()
+    scale = min(win_w / SCREEN_W, win_h / SCREEN_H) or 1.0
+    return (event.dx * win_w / scale, event.dy * win_h / scale)
+
+
+TOUCH_SAFE_MARGIN = 6          # logical px kept clear of every screen edge -- a manual
+                                # stand-in for an OS safe-area/notch inset, since pygame/SDL
+                                # expose no such API in the general case
+TOUCH_INACTIVITY_MS = 3500     # hybrid devices: start fading out this long after the last touch
+TOUCH_FADE_MS = 220             # fade in/out duration
+TOUCH_ANDROID_MIN_ALPHA = 0.35  # Android never fades below this -- it has no keyboard fallback
+TOUCH_SIZE_MIN, TOUCH_SIZE_MAX = 0.8, 1.2  # Settings' Touch Size slider maps 0..1 onto this
+
+
+def _draw_touch_icon(surf, kind, cx, cy, r, color):
+    """Small hand-drawn icons for the touch overlay -- plain pygame.draw shapes, matching
+    every other in-game icon (spikes, the checkpoint flag, coins, ...) instead of depending
+    on whatever system font happens to be installed actually having e.g. a down-triangle
+    glyph."""
+    s = r * 0.5
+    if kind == "left":
+        pygame.draw.polygon(surf, color, [(cx + s * 0.5, cy - s), (cx - s * 0.7, cy), (cx + s * 0.5, cy + s)])
+    elif kind == "right":
+        pygame.draw.polygon(surf, color, [(cx - s * 0.5, cy - s), (cx + s * 0.7, cy), (cx - s * 0.5, cy + s)])
+    elif kind == "up":
+        pygame.draw.polygon(surf, color, [(cx, cy - s), (cx - s, cy + s * 0.7), (cx + s, cy + s * 0.7)])
+    elif kind == "down":
+        pygame.draw.polygon(surf, color, [(cx, cy + s), (cx - s, cy - s * 0.7), (cx + s, cy - s * 0.7)])
+    elif kind == "dash":
+        for dx in (-s * 0.55, s * 0.35):
+            pygame.draw.polygon(surf, color, [(cx + dx - s * 0.3, cy - s * 0.6), (cx + dx + s * 0.4, cy),
+                                               (cx + dx - s * 0.3, cy + s * 0.6)])
+    elif kind == "pause":
+        bar_w, bar_h, gap = max(2, round(s * 0.35)), round(s * 1.4), max(2, round(s * 0.3))
+        pygame.draw.rect(surf, color, (cx - gap - bar_w, cy - bar_h // 2, bar_w, bar_h), border_radius=1)
+        pygame.draw.rect(surf, color, (cx + gap, cy - bar_h // 2, bar_w, bar_h), border_radius=1)
+    elif kind == "pause_toggle":
+        # The one touch button that means two different things depending on state: a
+        # Pause icon while playing, a Play/Resume triangle once paused -- see
+        # TouchControls._buttons_for_state(), which is what keeps it on screen (and at
+        # the same spot) across that transition instead of disappearing along with every
+        # other gameplay button the moment the world freezes.
+        _draw_touch_icon(surf, "right" if state == "paused" else "pause", cx, cy, r, color)
+
+
+def _toggle_pause():
+    """The Esc key and the touch overlay's Pause button both go through this, so the two
+    input methods can never end up with a different idea of what pausing does."""
+    global state
+    if state == "playing":
+        state = "paused"
+    elif state == "paused":
+        state = "playing"
+
+
+class TouchButton:
+    """One press-region of the touch overlay. Position is defined as an offset from
+    whichever screen corner it belongs to (`home_side`), not an absolute point -- that's
+    what lets TouchControls scale the whole cluster (Settings' Touch Size) or mirror it to
+    the opposite side (Settings' Swap Sides) just by changing how the offset is resolved,
+    in center_radius(), instead of storing a separate layout per setting combination.
+
+    `keys` are pygame key constants this button acts as "held" for while any finger is on
+    it (consumed by Player.update() for continuous actions -- move/glide/the jump-hold
+    that controls variable jump height). `on_press` (if given) fires once per finger that
+    lands on it, for edge-triggered actions (Jump/Dash/Pause) that go through the exact
+    same functions/state transitions a keyboard press already triggers in handle_events(),
+    instead of duplicating that logic here."""
+
+    def __init__(self, home_side, dx, dy, radius, icon, keys=(), on_press=None,
+                 color=(0, 255, 200), is_active=None):
+        self.home_side = home_side  # "left", "right", or "top"
+        self.dx, self.dy = dx, dy   # magnitude inward-from-edge / upward-from-bottom (or
+                                     # downward-from-top for "top"), always >= 0
+        self.radius = radius
+        self.icon = icon
+        self.keys = keys
+        self.on_press = on_press
+        self.color = color
+        self.is_active = is_active or (lambda: True)
+        self.fingers = set()  # finger_ids currently pressing this button
+
+    @property
+    def held(self):
+        return bool(self.fingers)
+
+    def center_radius(self, swap_sides, scale, margin):
+        side = self.home_side
+        if swap_sides and side in ("left", "right"):
+            side = "right" if side == "left" else "left"
+        if side == "left":
+            cx, cy = margin + self.dx * scale, SCREEN_H - margin - self.dy * scale
+        elif side == "right":
+            cx, cy = SCREEN_W - margin - self.dx * scale, SCREEN_H - margin - self.dy * scale
+        else:  # "top" -- fixed in place; Swap Sides only affects the move/action clusters
+            cx, cy = SCREEN_W / 2 + self.dx * scale, margin + self.dy * scale
+        return (cx, cy), self.radius * scale
+
+    def contains(self, pos, swap_sides, scale, margin):
+        (cx, cy), r = self.center_radius(swap_sides, scale, margin)
+        return (pos[0] - cx) ** 2 + (pos[1] - cy) ** 2 <= r * r
+
+    def draw(self, surf, swap_sides, scale, margin):
+        (cx, cy), r = self.center_radius(swap_sides, scale, margin)
+        cx, cy, r = round(cx), round(cy), round(r)
+        pressed = self.held
+        pygame.draw.circle(surf, (18, 16, 26, 165), (cx, cy), r)
+        ring_color = tuple(min(255, c + 60) for c in self.color) if pressed else self.color
+        pygame.draw.circle(surf, (*ring_color, 235), (cx, cy), r, 0 if pressed else 3)
+        icon_color = (15, 12, 22) if pressed else ring_color
+        _draw_touch_icon(surf, self.icon, cx, cy, r, icon_color)
+
+
+class TouchControls:
+    """Owns every piece of the touch-overlay feature: platform/touch detection, the fade
+    timer, per-button finger tracking, and the user-facing Settings (opacity/size/side).
+    One instance (`touch_controls`, created in init_game_state()) is read by
+    Player.update() (held_keys()), fed events by handle_events() (on_finger_*()), advanced
+    once a frame by game_loop() (update()), and drawn by draw_playing_frame() (draw())."""
+
+    def __init__(self):
+        self.is_android = _is_android()
+        self.ever_touched = self.is_android  # Android shows its controls immediately
+        self.last_touch_ms = _now_ms() if self.is_android else -10 ** 9
+        self._alpha = 1.0 if self.is_android else 0.0
+        self.opacity = 0.8       # Settings' Touch Opacity slider, 0..1
+        self.size = 1.0          # Settings' Touch Size slider, mapped into TOUCH_SIZE_MIN..MAX
+        self.swap_sides = False  # Settings' Swap Sides toggle
+
+        self.btn_left = TouchButton("left", 56, 70, 36, "left", keys=(pygame.K_LEFT,),
+                                     color=(0, 200, 255))
+        self.btn_right = TouchButton("left", 138, 70, 36, "right", keys=(pygame.K_RIGHT,),
+                                      color=(0, 200, 255))
+        self.btn_jump = TouchButton("right", 56, 70, 42, "up", keys=(pygame.K_SPACE,),
+                                     on_press=lambda: player.try_jump(), color=(0, 255, 200))
+        self.btn_dash = TouchButton("right", 140, 104, 28, "dash",
+                                     on_press=lambda: player.try_dash(), color=(120, 220, 255),
+                                     is_active=lambda: upgrades["dash"] > 0)
+        self.btn_glide = TouchButton("right", 140, 36, 26, "down", keys=(pygame.K_DOWN,),
+                                      color=(170, 220, 140), is_active=lambda: upgrades["glide"] > 0)
+        # Bigger than every other button (a mis-tap here is far more disruptive than one
+        # on Left/Right) and it's the one button that stays reachable through "paused" too
+        # -- see _buttons_for_state() and _draw_touch_icon()'s "pause_toggle" case. dy/
+        # radius are tuned to clear the "PAUSED" title (title_font, centered at y=70,
+        # its rendered rect top lands at y=48) with a few px to spare.
+        self.btn_pause = TouchButton("top", 0, 16, 20, "pause_toggle", on_press=_toggle_pause,
+                                      color=(255, 210, 90))
+        self.buttons = [self.btn_left, self.btn_right, self.btn_jump, self.btn_dash,
+                         self.btn_glide, self.btn_pause]
+
+    def _active_buttons(self):
+        return [b for b in self.buttons if b.is_active()]
+
+    def _buttons_for_state(self):
+        """Which buttons actually exist right now. Movement/action buttons only make
+        sense while the world is live ("playing"); once paused, everything except the
+        Pause/Resume toggle disappears (the real pause menu takes over from there, and
+        it's just as reachable from a touch as from a mouse -- see handle_events()).
+        Anywhere else (menus, settings, help, ...) there's no touch-overlay button at
+        all."""
+        if state == "playing":
+            return self._active_buttons()
+        if state == "paused":
+            return [self.btn_pause]
+        return []
+
+    def held_keys(self):
+        return {k for b in self._buttons_for_state() if b.held for k in b.keys}
+
+    def on_finger_down(self, event):
+        self.ever_touched = True
+        self.last_touch_ms = _now_ms()
+        pos = _finger_event_logical_pos(event)
+        for b in self._buttons_for_state():
+            if b.contains(pos, self.swap_sides, self.size, TOUCH_SAFE_MARGIN):
+                b.fingers.add(event.finger_id)
+                if b.on_press:
+                    b.on_press()
+
+    def on_finger_up(self, event):
+        self.last_touch_ms = _now_ms()
+        for b in self.buttons:
+            b.fingers.discard(event.finger_id)
+
+    def on_finger_motion(self, event):
+        self.last_touch_ms = _now_ms()
+
+    def update(self, dt_ms):
+        """Advance the fade timer -- called once per rendered frame regardless of game
+        state, so a touch anywhere (even in a menu) starts the fade-in, and a hybrid
+        device keeps counting down toward hiding again even on frames where the overlay
+        itself isn't drawn."""
+        if not self.ever_touched:
+            self._alpha = 0.0
+            return
+        floor = TOUCH_ANDROID_MIN_ALPHA if self.is_android else 0.0
+        idle_ms = _now_ms() - self.last_touch_ms
+        target = 1.0 if idle_ms < TOUCH_INACTIVITY_MS else floor
+        step = dt_ms / TOUCH_FADE_MS
+        if self._alpha < target:
+            self._alpha = min(target, self._alpha + step)
+        else:
+            self._alpha = max(target, self._alpha - step)
+
+    def effective_alpha(self):
+        return self._alpha * self.opacity
+
+    def draw(self, surf):
+        buttons = self._buttons_for_state()
+        eff = self.effective_alpha()
+        if not buttons or eff <= 0.01:
+            return
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        for b in buttons:
+            b.draw(overlay, self.swap_sides, self.size, TOUCH_SAFE_MARGIN)
+        overlay.set_alpha(round(255 * eff))
+        surf.blit(overlay, (0, 0))
+
+
 def build_menu_background():
     # simple flat dark gradient -- no grid/sun clutter, just a calm neon-toned backdrop
     surf = pygame.Surface((SCREEN_W, SCREEN_H))
@@ -2589,6 +2859,9 @@ SAVE_DEFAULTS = {
     "equipped_trail_id": 0,  # 0 = no trail equipped, else a 1-based index into TRAILS
     "trail_visible": 1,
     "fps_cap": FPS_CAP_DEFAULT,  # 0 = Unlimited, else a capped positive integer -- see Settings
+    "touch_opacity": 80, "touch_size": 50, "touch_swap_sides": 0,
+    "touch_ever_used": 0,  # sticky flag: once a real touch is seen, Settings keeps showing
+                           # the touch rows even after restarting with no keyboard/mouse used
 }
 SAVE_DEFAULTS.update({f"upg_{key}": 0 for key in UPGRADE_DEFAULTS})
 SAVE_DEFAULTS.update({f"trail_owned_{key}": 0 for key in TRAIL_DEFAULTS})
@@ -2630,6 +2903,10 @@ def _clamp_save_data(data):
     data["trail_visible"] = 1 if data.get("trail_visible", 1) else 0
     fps_cap_value = data.get("fps_cap", FPS_CAP_DEFAULT)
     data["fps_cap"] = FPS_CAP_UNLIMITED if fps_cap_value <= 0 else _clamp(fps_cap_value, FPS_CAP_MIN, FPS_CAP_MAX)
+    data["touch_opacity"] = _clamp(data.get("touch_opacity", 80), 0, 100)
+    data["touch_size"] = _clamp(data.get("touch_size", 50), 0, 100)
+    data["touch_swap_sides"] = 1 if data.get("touch_swap_sides", 0) else 0
+    data["touch_ever_used"] = 1 if data.get("touch_ever_used", 0) else 0
     return data
 
 
@@ -2717,6 +2994,10 @@ def save_game():
         "equipped_trail_id": TRAIL_KEY_TO_ID.get(equipped_trail_key, 0) if equipped_trail_key else 0,
         "trail_visible": int(trail_visible),
         "fps_cap": fps_cap,
+        "touch_opacity": round(touch_controls.opacity * 100),
+        "touch_size": round((touch_controls.size - TOUCH_SIZE_MIN) / (TOUCH_SIZE_MAX - TOUCH_SIZE_MIN) * 100),
+        "touch_swap_sides": int(touch_controls.swap_sides),
+        "touch_ever_used": int(touch_controls.ever_touched),
     }
     data.update({f"upg_{key}": lvl for key, lvl in upgrades.items()})
     data.update({f"trail_owned_{key}": 1 if key in owned_trails else 0 for key in TRAIL_DEFAULTS})
@@ -2756,6 +3037,116 @@ def _discover_save_files():
         return []
     names = sorted((n for n in os.listdir(save_dir) if _is_save_filename(n)), key=_save_slot_sort_key)
     return [os.path.join(save_dir, n) for n in names]
+
+
+def _backup_dir():
+    """Where backup_save() (and nothing else) writes to -- a subfolder next to the real
+    save file, deliberately never scanned by _discover_save_files(). An earlier version
+    of this feature wrote save<N>.txt directly next to save.txt, which meant every backup
+    immediately became a second selectable slot in choose_save_file()'s "multiple save
+    files found" picker at the next launch -- confusing at best (why is the game asking
+    which save to play?), and at worst an easy way to accidentally launch into a stale
+    backup instead of your real progress. Backups now live somewhere that picker never
+    looks, so making one can never change which save the game actually loads."""
+    d = os.path.join(os.path.dirname(SAVE_FILE) or ".", "backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def backup_save():
+    """Duplicates the current save into backups/save_backup_<timestamp>.txt. This is
+    export_save()'s fallback when a native file dialog isn't available (see
+    _tk_file_dialog()) -- there's no tkinter on Android, where this in-place backup is
+    what "export" means instead (see the Help entry for how to bring it back: drop the
+    file into the save folder, as save.txt or any save<N>.txt, before launching).
+    Returns the new path, or None if the copy failed (e.g. a read-only install
+    location)."""
+    save_game()  # flush the very latest state first, not a stale on-disk copy
+    dest = os.path.join(_backup_dir(), f"save_backup_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    try:
+        shutil.copy2(SAVE_FILE, dest)
+        return dest
+    except OSError:
+        return None
+
+
+class _FileDialogUnavailable(Exception):
+    """tkinter isn't installed/importable -- expected on Android, and not guaranteed on
+    every desktop Python install either."""
+
+
+def _tk_file_dialog(mode, **kwargs):
+    """Runs a native OS Save-As/Open dialog via tkinter -- pygame has no file dialog of
+    its own, and this is the only way to let the player pick an arbitrary export/import
+    location instead of a fixed in-folder slot. A hidden, throwaway Tk root drives the
+    (modal, blocking) dialog and is destroyed immediately after; the pygame window stays
+    open underneath the whole time, same as any native file picker layered on top of a
+    game. Returns the chosen path, or None if the player cancelled."""
+    try:
+        import tkinter
+        from tkinter import filedialog
+    except Exception as e:
+        raise _FileDialogUnavailable from e
+    root = tkinter.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        fn = filedialog.asksaveasfilename if mode == "save" else filedialog.askopenfilename
+        path = fn(**kwargs)
+    finally:
+        root.destroy()
+    return path or None
+
+
+def export_save():
+    """Lets the player export their save to any location/filename they choose via a
+    native file dialog, falling back to backup_save() if tkinter isn't available.
+    Returns a short message for the main menu's toast (see handle_events())."""
+    save_game()
+    try:
+        dest = _tk_file_dialog(
+            "save", defaultextension=".txt", filetypes=[("Save files", "*.txt"), ("All files", "*.*")],
+            initialfile="platformer_save.txt", title="Export Save As",
+        )
+    except _FileDialogUnavailable:
+        path = backup_save()
+        return (f"No file dialog available -- saved a backup at backups/{os.path.basename(path)}"
+                if path else "Export failed")
+    if dest is None:
+        return "Export cancelled"
+    try:
+        shutil.copy2(SAVE_FILE, dest)
+        return f"Exported save to {dest}"
+    except OSError:
+        return "Export failed -- couldn't write to that location"
+
+
+def import_save():
+    """Lets the player import a save from any file they choose via a native file dialog,
+    overwriting the current save and reloading the whole game state from it. load_save()
+    tolerates a garbage/non-save file already (see its docstring), so picking the wrong
+    file just lands on mostly-default values instead of crashing. Falls back to a short
+    explanatory message if tkinter isn't available -- there's no tkinter on Android,
+    where dropping the file into the save folder before launching is how importing works
+    instead (see the Help entry)."""
+    global SAVE_FILE
+    try:
+        src = _tk_file_dialog(
+            "open", filetypes=[("Save files", "*.txt"), ("All files", "*.*")], title="Import Save",
+        )
+    except _FileDialogUnavailable:
+        return "No file dialog available -- see Help for how to import a save manually"
+    if src is None:
+        return "Import cancelled"
+    try:
+        shutil.copy2(src, SAVE_FILE)
+    except OSError:
+        return "Import failed -- couldn't read that file"
+    init_game_state()
+    return f"Imported save from {src}"
 
 
 def _save_picker_layout(candidates):
@@ -3053,6 +3444,23 @@ def sync_settings_from_widgets():
     fps_cap = fps_cap_control.value
     music.set_volume(music_volume / 100.0)
     apply_sfx_volume(sfx_volume / 100.0)
+    if touch_controls.ever_touched:
+        touch_controls.opacity = slider_touch_opacity.value
+        touch_controls.size = TOUCH_SIZE_MIN + slider_touch_size.value * (TOUCH_SIZE_MAX - TOUCH_SIZE_MIN)
+        touch_controls.swap_sides = toggle_touch_swap.value
+
+
+def _sync_settings_widgets_from_globals():
+    """The opposite direction of sync_settings_from_widgets() -- pulls Fullscreen/Show
+    FPS/Mute's current values into their Settings widgets. Needed because those three
+    (unlike Screen Shake, Music, SFX, FPS Cap) can also change from a keyboard shortcut
+    (F11/F3/M) or the pause menu's quick Mute toggle while the Settings screen isn't even
+    open, which would otherwise leave a widget showing a stale value next time it's
+    opened. Called at every "open Settings" site, right before state flips to
+    "paused_settings"."""
+    toggle_fullscreen.value = fullscreen
+    toggle_show_fps.value = show_fps
+    toggle_mute.value = muted
 
 
 def start_game():
@@ -3359,15 +3767,17 @@ def init_game_state():
     global level_width, level_palette, camera, background, player
     global font, small_font, title_font, MENU_BG
     global toggle_shake, slider_volume, slider_sfx, fps_cap, fps_cap_control
+    global toggle_fullscreen, toggle_show_fps, toggle_mute
+    global touch_controls, slider_touch_opacity, slider_touch_size, toggle_touch_swap
     global PLAY_RECT, SHOP_ENTRY_RECT, TRAIL_ENTRY_RECT, HELP_ENTRY_RECT, SHOP_BACK_PROMPT, SHOP_BACK_RECT
     global TRAIL_UNEQUIP_RECT, TRAIL_VISIBILITY_RECT
     global PAUSE_RESUME_RECT, PAUSE_HELP_RECT, PAUSE_SETTINGS_RECT, PAUSE_MAIN_MENU_RECT, PAUSE_QUIT_RECT
     global PAUSE_SHAKE_TOGGLE_RECT, PAUSE_MUTE_TOGGLE_RECT
     global running, state, resume_state, transition_start, muted, show_fps, shop_page, shop_subpage
-    global particles, popups, _dirty, _last_autosave
+    global particles, popups, _dirty, _last_autosave, menu_toast_text, menu_toast_until
     global owned_trails, equipped_trail_key, trail_visible, _last_trail_particle_time, trail_page, recent_trails
     global paused_from, help_scroll, is_replay, replay_level, replay_page
-    global REPLAY_ENTRY_RECT, SETTINGS_ENTRY_RECT
+    global REPLAY_ENTRY_RECT, SETTINGS_ENTRY_RECT, QUIT_ENTRY_RECT, EXPORT_SAVE_RECT, IMPORT_SAVE_RECT
 
     _save_data = load_save()
     level_num = _save_data["level"]
@@ -3398,6 +3808,12 @@ def init_game_state():
     replay_level = None
     replay_page = 0
 
+    touch_controls = TouchControls()
+    touch_controls.ever_touched = touch_controls.ever_touched or bool(_save_data["touch_ever_used"])
+    touch_controls.opacity = _save_data["touch_opacity"] / 100.0
+    touch_controls.size = TOUCH_SIZE_MIN + (_save_data["touch_size"] / 100.0) * (TOUCH_SIZE_MAX - TOUCH_SIZE_MIN)
+    touch_controls.swap_sides = bool(_save_data["touch_swap_sides"])
+
     font = pygame.font.SysFont(None, 44)
     small_font = pygame.font.SysFont(None, 22)
     title_font = pygame.font.SysFont(None, 64)
@@ -3407,6 +3823,21 @@ def init_game_state():
     slider_volume = Slider(SCREEN_W // 2 - 100, 175, 200, "Music Volume", music_volume / 100.0)
     slider_sfx = Slider(SCREEN_W // 2 - 100, 235, 200, "Sound Effects", sfx_volume / 100.0)
     fps_cap_control = FpsCapControl(SCREEN_W // 2 - 146, 300, fps_cap)
+    # Fullscreen/FPS-counter/Mute previously only had keyboard shortcuts (F11/F3/M) --
+    # tucked into the LEFT margin beside the three centered rows above (each narrower than
+    # the 800px-wide screen) so a touch or mouse click reaches every one of them too,
+    # without a new row or disturbing the existing layout.
+    # show_fps/muted are set below (they're session-only, never persisted) -- both
+    # always start False, same as the literals used here.
+    toggle_fullscreen = Toggle(46, 175, "Fullscreen", fullscreen)
+    toggle_show_fps = Toggle(46, 235, "Show FPS", False)
+    toggle_mute = Toggle(46, 300, "Mute", False)
+    # Touch-specific rows are tucked into the RIGHT margin instead, and only ever show up
+    # for players Settings' touch rows are actually relevant to (see
+    # touch_controls.ever_touched) without disturbing the existing layout for anyone else.
+    slider_touch_opacity = Slider(610, 175, 170, "Touch Opacity", touch_controls.opacity)
+    slider_touch_size = Slider(610, 235, 170, "Touch Size", _save_data["touch_size"] / 100.0)
+    toggle_touch_swap = Toggle(668, 300, "Swap Sides", touch_controls.swap_sides)
     PLAY_RECT = pygame.Rect(0, 0, 240, 54)
     PLAY_RECT.center = (SCREEN_W // 2, 278)
     _menu_btn_w, _menu_btn_h, _menu_btn_gap = 130, 40, 14
@@ -3416,6 +3847,16 @@ def init_game_state():
     HELP_ENTRY_RECT = pygame.Rect(_menu_row_start_x + 2 * (_menu_btn_w + _menu_btn_gap), 320, _menu_btn_w, _menu_btn_h)
     REPLAY_ENTRY_RECT = pygame.Rect(_menu_row_start_x + 3 * (_menu_btn_w + _menu_btn_gap), 320, _menu_btn_w, _menu_btn_h)
     SETTINGS_ENTRY_RECT = pygame.Rect(_menu_row_start_x + 4 * (_menu_btn_w + _menu_btn_gap), 320, _menu_btn_w, _menu_btn_h)
+    # Off in its own corner rather than a 6th slot in the row above: on a touch-only
+    # device (no Esc key, and often no window-chrome close button either -- Android in
+    # particular) that row is otherwise the only way in or out of the game, and Quit
+    # doesn't belong crammed in alongside Shop/Trails/Help/Replay/Settings.
+    QUIT_ENTRY_RECT = pygame.Rect(SCREEN_W - 98, 48, 84, 30)
+    # Mirrors QUIT_ENTRY_RECT on the opposite corner -- see export_save()/import_save()
+    # in handle_events() for what these actually do (a native file dialog, with a
+    # fallback if tkinter isn't available).
+    EXPORT_SAVE_RECT = pygame.Rect(14, 48, 100, 30)
+    IMPORT_SAVE_RECT = pygame.Rect(14, 82, 100, 30)
     SHOP_BACK_PROMPT = "PRESS ESC OR CLICK TO GO BACK"
     SHOP_BACK_RECT = small_font.render(SHOP_BACK_PROMPT, True, WHITE).get_rect(center=(SCREEN_W // 2, 415))
     TRAIL_UNEQUIP_RECT = pygame.Rect(SCREEN_W // 2 - 260, 103, 220, 32)
@@ -3451,13 +3892,36 @@ def init_game_state():
     popups = []
     _dirty = False
     _last_autosave = _now_ms()
+    menu_toast_text = ""
+    menu_toast_until = 0
 
 # ---------------- game loop ----------------
 def handle_events():
     global running, fullscreen, screen, show_fps, state, resume_state, shop_page, shop_subpage
     global trail_page, help_scroll, paused_from, replay_page, screen_shake_enabled, replay_search_text
+    global menu_toast_text, menu_toast_until
 
     for event in pygame.event.get():
+        # Every menu/button/slider/toggle in the game is written in terms of
+        # MOUSEBUTTONDOWN/UP/MOTION -- that's left entirely alone here, so a touch is
+        # picked up through SDL's own, platform-tested touch-to-mouse event synthesis
+        # (on by default; see https://wiki.libsdl.org/SDL2/SDL_HINT_TOUCH_MOUSE_EVENTS)
+        # exactly the same way a real mouse click would be. The one thing that mechanism
+        # can't do is multitouch (it's a single synthesized pointer), which is what the
+        # touch overlay's own buttons (Left/Right/Jump/...) need -- those are driven
+        # directly from the real FINGERDOWN/UP/MOTION events instead, via TouchControls.
+        if event.type == pygame.FINGERDOWN:
+            touch_controls.on_finger_down(event)
+        elif event.type == pygame.FINGERUP:
+            touch_controls.on_finger_up(event)
+        elif event.type == pygame.FINGERMOTION:
+            touch_controls.on_finger_motion(event)
+            if state == "help":
+                # The help screen has no slider to drag -- a vertical swipe scrolls its
+                # content directly, the one screen-specific touch gesture in the game.
+                _, dy_px = _finger_event_logical_delta(event)
+                help_scroll = max(0, min(_help_max_scroll(), round(help_scroll - dy_px)))
+
         if event.type == pygame.QUIT:
             quit_game()
         elif event.type == pygame.KEYDOWN:
@@ -3472,10 +3936,8 @@ def handle_events():
                     state = paused_from  # "menu" or "paused", whichever opened Settings
                 elif state == "menu":
                     quit_game()
-                elif state == "playing":
-                    state = "paused"
-                elif state == "paused":
-                    state = "playing"
+                elif state in ("playing", "paused"):
+                    _toggle_pause()
                 else:
                     resume_state = state
                     save_game()
@@ -3502,6 +3964,7 @@ def handle_events():
                     state = "replay_picker"
                 if event.key == pygame.K_o:
                     paused_from = "menu"
+                    _sync_settings_widgets_from_globals()
                     state = "paused_settings"
             elif state == "replay_picker":
                 if event.key == pygame.K_UP:
@@ -3578,7 +4041,16 @@ def handle_events():
                     state = "replay_picker"
                 elif SETTINGS_ENTRY_RECT.collidepoint(event.pos):
                     paused_from = "menu"
+                    _sync_settings_widgets_from_globals()
                     state = "paused_settings"
+                elif QUIT_ENTRY_RECT.collidepoint(event.pos):
+                    quit_game()
+                elif EXPORT_SAVE_RECT.collidepoint(event.pos):
+                    menu_toast_text = export_save()
+                    menu_toast_until = _now_ms() + 4000
+                elif IMPORT_SAVE_RECT.collidepoint(event.pos):
+                    menu_toast_text = import_save()
+                    menu_toast_until = _now_ms() + 4000
         elif state == "shop":
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 category = SHOP_CATEGORIES[shop_page]
@@ -3652,11 +4124,13 @@ def handle_events():
                     save_game()
                 elif PAUSE_MUTE_TOGGLE_RECT.collidepoint(event.pos):
                     set_muted(not muted)
+                    toggle_mute.value = muted  # keep the Settings widget in sync
                 elif PAUSE_HELP_RECT.collidepoint(event.pos):
                     paused_from = "paused"
                     state = "help"
                 elif PAUSE_SETTINGS_RECT.collidepoint(event.pos):
                     paused_from = "paused"
+                    _sync_settings_widgets_from_globals()
                     state = "paused_settings"
                 elif PAUSE_MAIN_MENU_RECT.collidepoint(event.pos):
                     if is_replay:
@@ -3672,6 +4146,13 @@ def handle_events():
             sfx_was_dragging = slider_sfx.dragging
             slider_sfx.handle_event(event)
             fps_cap_control.handle_event(event)
+            toggle_fullscreen.handle_event(event)
+            toggle_show_fps.handle_event(event)
+            toggle_mute.handle_event(event)
+            if touch_controls.ever_touched:
+                slider_touch_opacity.handle_event(event)
+                slider_touch_size.handle_event(event)
+                toggle_touch_swap.handle_event(event)
             if sfx_was_dragging and event.type == pygame.MOUSEBUTTONUP:
                 snd_coin.play()
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -3699,12 +4180,24 @@ def draw_menu():
     draw_menu_button(HELP_ENTRY_RECT, "HELP", HELP_ENTRY_RECT.collidepoint(mouse_pos), sub_label="H")
     draw_menu_button(REPLAY_ENTRY_RECT, "REPLAY", REPLAY_ENTRY_RECT.collidepoint(mouse_pos), sub_label="R")
     draw_menu_button(SETTINGS_ENTRY_RECT, "SETTINGS", SETTINGS_ENTRY_RECT.collidepoint(mouse_pos), sub_label="O")
+    draw_menu_button(QUIT_ENTRY_RECT, "QUIT", QUIT_ENTRY_RECT.collidepoint(mouse_pos))
+    draw_menu_button(EXPORT_SAVE_RECT, "EXPORT", EXPORT_SAVE_RECT.collidepoint(mouse_pos))
+    draw_menu_button(IMPORT_SAVE_RECT, "IMPORT", IMPORT_SAVE_RECT.collidepoint(mouse_pos))
 
-    stats_surf = small_font.render(
-        f"Lifetime: {stat_coins:,} coins earned | {stat_stomps:,} stomps | {stat_deaths:,} deaths",
-        True,
-        (140, 140, 160),
-    )
+    # A live Export/Import confirmation or error briefly takes over this line instead of
+    # adding new geometry that would have to squeeze into an already-tight 440px-tall
+    # screen -- see export_save()/import_save()'s call sites in handle_events().
+    # render_text_fit() rather than a plain render(): a chosen export/import path can
+    # easily be wider than the screen (render_text_fit shrinks it to fit instead of
+    # letting it run off both edges).
+    if _now_ms() < menu_toast_until:
+        stats_surf = render_text_fit(small_font, menu_toast_text, (255, 230, 120), SCREEN_W - 40)
+    else:
+        stats_surf = small_font.render(
+            f"Lifetime: {stat_coins:,} coins earned | {stat_stomps:,} stomps | {stat_deaths:,} deaths",
+            True,
+            (140, 140, 160),
+        )
     screen.blit(stats_surf, stats_surf.get_rect(center=(SCREEN_W // 2, 386)))
 
     hint = small_font.render(f"Coins: {wallet}   F11: Fullscreen   F3: FPS   Esc: Quit", True, (150, 150, 170))
@@ -3940,6 +4433,22 @@ HELP_CONTENT = [
         "Dash: Shift (once you've bought the Dash upgrade).",
         "Glide: hold Down while falling (once you've bought Feather Fall).",
         "Mute: M.  FPS counter: F3.  Fullscreen: F11.  Pause/back: Esc.",
+        "Fullscreen, FPS counter, and Mute also have a toggle on the Settings screen, so",
+        "they're reachable with a mouse or a touch, not just those keyboard shortcuts.",
+    ]),
+    ("Touch Controls", [
+        "On a touchscreen -- Android, or a touch-capable device like a Windows tablet or",
+        "a Steam Deck in touch mode -- on-screen buttons for Left/Right, Jump, Dash and",
+        "Glide (once owned), and Pause appear the first time you touch the screen, fade",
+        "out after a few seconds of inactivity, and fade back in the moment you touch",
+        "again. On Android they never fully disappear, since there's no keyboard to fall",
+        "back to. The Pause button doubles as Resume once the game is actually paused.",
+        "Every menu, button, and slider in the game -- Play, Shop, Settings, Pause menu,",
+        "Help's scrollbar (or just swipe), all of it -- responds to a tap the same way",
+        "it responds to a mouse click, so no separate touch navigation exists or is",
+        "needed. Once the game has seen a touch, three extra Settings rows appear to",
+        "customize the on-screen buttons: Touch Opacity, Touch Size, and Swap Sides",
+        "(mirrors Left/Right/Jump/Dash/Glide to the opposite side of the screen).",
     ]),
     ("Movement", [
         "You get a short grace window to jump just after walking off a ledge (coyote",
@@ -4015,6 +4524,18 @@ HELP_CONTENT = [
         "Progress saves automatically: periodically while playing, and always when you",
         "finish a level, make a purchase, pause, or quit. Nothing is lost by closing",
         "the game normally.",
+        "",
+        f"The save file lives at: {os.path.dirname(SAVE_FILE) or '.'}",
+        "",
+        "EXPORT (top-left of the main menu) opens a native Save-As dialog so you can",
+        "save a copy anywhere you like -- a USB drive, cloud folder, another device,",
+        "wherever. IMPORT opens the matching Open dialog to load any save file back in,",
+        "replacing your current progress. Neither is available on Android (there's no",
+        "such dialog there) -- EXPORT instead drops a timestamped copy in a \"backups\"",
+        "folder next to the save file, and IMPORTing means placing a file in the folder",
+        "above (as save.txt) yourself before launching. If more than one save.txt/",
+        "save<N>.txt sits directly in that folder (not in \"backups\"), a picker appears",
+        "at startup letting you choose which one to play.",
     ]),
     ("Pause Menu", [
         "Esc during a run opens the Pause menu, which fully freezes gameplay. From",
@@ -4022,9 +4543,11 @@ HELP_CONTENT = [
     ]),
     ("Settings & Statistics", [
         "Screen Shake, Music Volume, and Sound Effects volume live on the main menu;",
-        "the full Settings screen (same controls, plus FPS Cap) opens from the main",
-        "menu's SETTINGS button (O) or Pause -> Settings during a run. FPS Cap picks",
-        "any frame rate, or Unlimited -- it only changes smoothness, never game speed.",
+        "the full Settings screen (same controls, plus FPS Cap, Fullscreen, Show FPS,",
+        "and Mute) opens from the main menu's SETTINGS button (O) or Pause -> Settings",
+        "during a run. FPS Cap picks any frame rate, or Unlimited -- it only changes",
+        "smoothness, never game speed. If the game has ever seen a touch, three more",
+        "rows appear for customizing the on-screen touch buttons (see Touch Controls).",
         "The Shop's Statistics tab shows your current level, score, lifetime coins",
         "earned, stomps, deaths, best stomp combo, and how many upgrades/trails you own.",
     ]),
@@ -4127,7 +4650,9 @@ def draw_help():
         thumb_h = max(24, int(viewport.h * viewport.h / _help_content_height()))
         thumb_y = viewport.y + int((viewport.h - thumb_h) * (help_scroll / max_scroll))
         pygame.draw.rect(screen, (0, 255, 200), (track.x, thumb_y, track.w, thumb_h), border_radius=3)
-        hint = small_font.render("Up/Down or mouse wheel to scroll", True, (150, 150, 170))
+        hint_text = "Up/Down, mouse wheel, or swipe to scroll" if touch_controls.ever_touched \
+            else "Up/Down or mouse wheel to scroll"
+        hint = small_font.render(hint_text, True, (150, 150, 170))
         screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, 393)))
 
     back_surf = small_font.render(SHOP_BACK_PROMPT, True, (200, 200, 220))
@@ -4164,15 +4689,26 @@ def draw_paused():
     hint = small_font.render(f"Level {level_num}  |  Score: {score}  |  Coins: {wallet}", True, (150, 150, 170))
     screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, 412)))
 
+    touch_controls.draw(screen)  # just the Pause/Resume toggle -- see _buttons_for_state()
+
     pygame.display.flip()
 
 
 def draw_paused_settings():
-    global fps_cap
+    global fps_cap, fullscreen, screen, show_fps
     # Applied straight from the live widget every frame (same pattern draw_menu() uses
     # for music/SFX volume) so dragging/typing a new FPS Cap takes effect on the very
     # next rendered frame -- no separate "Apply" step, no restart needed.
     fps_cap = fps_cap_control.value
+    show_fps = toggle_show_fps.value
+    if toggle_mute.value != muted:
+        set_muted(toggle_mute.value)
+    if toggle_fullscreen.value != fullscreen:
+        # Same mode switch F11 does (see handle_events()) -- just reachable by touch/
+        # mouse now instead of only a keyboard shortcut.
+        fullscreen = toggle_fullscreen.value
+        flags = pygame.SCALED | (pygame.FULLSCREEN if fullscreen else 0)
+        screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
 
     screen.blit(MENU_BG, (0, 0))
     draw_glow_text(screen, "SETTINGS", title_font, (SCREEN_W // 2, 60), (0, 255, 220))
@@ -4181,6 +4717,16 @@ def draw_paused_settings():
     slider_volume.draw(screen, small_font)
     slider_sfx.draw(screen, small_font)
     fps_cap_control.draw(screen, small_font)
+    toggle_fullscreen.draw(screen, small_font)
+    toggle_show_fps.draw(screen, small_font)
+    toggle_mute.draw(screen, small_font)
+    if touch_controls.ever_touched:
+        touch_controls.opacity = slider_touch_opacity.value
+        touch_controls.size = TOUCH_SIZE_MIN + slider_touch_size.value * (TOUCH_SIZE_MAX - TOUCH_SIZE_MIN)
+        touch_controls.swap_sides = toggle_touch_swap.value
+        slider_touch_opacity.draw(screen, small_font)
+        slider_touch_size.draw(screen, small_font)
+        toggle_touch_swap.draw(screen, small_font)
 
     back_surf = small_font.render("PRESS ESC OR CLICK TO GO BACK", True, (200, 200, 220))
     screen.blit(back_surf, SHOP_BACK_RECT)
@@ -4364,16 +4910,21 @@ def draw_playing_frame(alpha=1.0):
         level_label = f"REPLAY: Level {replay_level}" if is_replay else f"Level {level_num}"
         level_surf = small_font.render(level_label, True, (255, 190, 90) if is_replay else WHITE)
         draw_hud_text(screen, level_surf, (SCREEN_W - level_surf.get_width() - 10, top_right_y))
-        hud_surf = small_font.render(
-            "Move: Arrows/WASD  Jump: Space/Up  Shift: Dash  Down: Glide  M: Mute  F3: FPS  F11: Full  Esc: Menu",
-            True, WHITE,
-        )
-        draw_hud_text(screen, hud_surf, (10, SCREEN_H - hud_surf.get_height() - 8))
+        if touch_controls.effective_alpha() < 0.05:
+            # The touch overlay explains itself visually -- this legacy keyboard hint would
+            # otherwise sit right underneath the touch buttons drawn below.
+            hud_surf = small_font.render(
+                "Move: Arrows/WASD  Jump: Space/Up  Shift: Dash  Down: Glide  M: Mute  F3: FPS  F11: Full  Esc: Menu",
+                True, WHITE,
+            )
+            draw_hud_text(screen, hud_surf, (10, SCREEN_H - hud_surf.get_height() - 8))
 
         if state == "level_complete":
             text_surf = font.render(f"Level {level_num} complete!", True, WHITE)
             draw_hud_text(screen, text_surf, text_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2)).topleft,
                            pad=10)
+
+        touch_controls.draw(screen)  # no-op unless state == "playing" -- see _buttons_for_state()
 
         pygame.display.flip()
     finally:
@@ -4458,6 +5009,7 @@ def game_loop(max_frames=None):
         frame_time_ms = clock.tick(fps_cap)
         frame_count += 1
 
+        touch_controls.update(frame_time_ms)
         handle_events()
 
         if state == "menu":
@@ -4531,8 +5083,12 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-    if "--smoke-test" not in sys.argv:
+    if "__compiled__" in globals() and sys.platform == "win32" and "--smoke-test" not in sys.argv:
         # Keeps a double-clicked packaged .exe's console window open instead of
-        # vanishing instantly -- skipped in --smoke-test (CI/automated, non-interactive
-        # stdin) mode so that keeps working headlessly.
-        input("press enter to exit")
+        # vanishing instantly, so a fatal-error message can actually be read -- that's
+        # the ONLY scenario this is for (hence gating on __compiled__, the same Nuitka
+        # marker _app_dir() checks). A plain `python main.py` run -- every dev/
+        # interactive session, and any touchscreen device with no physical keyboard to
+        # send Enter with -- would otherwise sit here forever after the game window has
+        # already closed, looking exactly like the process hung.
+        input("Press Enter to exit...")
